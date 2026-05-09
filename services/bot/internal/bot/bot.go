@@ -27,7 +27,18 @@ func New(token string, dc *discovery.Client, st *state.Store, db *pgxpool.Pool, 
 	if err != nil {
 		return nil, fmt.Errorf("bot api: %w", err)
 	}
-	return &Bot{api: api, discovery: dc, state: st, db: db, broker: mq}, nil
+	b := &Bot{api: api, discovery: dc, state: st, db: db, broker: mq}
+	b.registerCommands()
+	return b, nil
+}
+
+func (b *Bot) registerCommands() {
+	commands := []tgbotapi.BotCommand{
+		{Command: "mylist", Description: "Мои отслеживаемые товары"},
+		{Command: "pause", Description: "Управление паузой"},
+		{Command: "cancel", Description: "Отменить текущее действие"},
+	}
+	b.api.Request(tgbotapi.NewSetMyCommands(commands...))
 }
 
 func (b *Bot) Run(ctx context.Context) error {
@@ -56,11 +67,13 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 
 	if msg.Text == "/start" || msg.Text == "/cancel" {
 		b.state.Clear(ctx, chatID)
-		b.send(chatID, "Привет! Напиши название товара, который хочешь отслеживать.\n\nПример: iPhone 15 Pro\n\n/mylist — мои товары")
+		reply := tgbotapi.NewMessage(chatID, "Привет! Напиши название товара, который хочешь отслеживать.\n\nПример: iPhone 15 Pro")
+		reply.ReplyMarkup = mainKeyboard()
+		b.api.Send(reply)
 		return
 	}
 
-	if msg.Text == "/mylist" || msg.Text == "/pause" {
+	if msg.Text == "/mylist" || msg.Text == "/pause" || msg.Text == "📋 Мои товары" {
 		b.state.Clear(ctx, chatID)
 		b.handleMyList(ctx, chatID)
 		return
@@ -125,4 +138,12 @@ func (b *Bot) send(chatID int64, text string) {
 	if _, err := b.api.Send(msg); err != nil {
 		slog.Error("send message failed", "chat_id", chatID, "error", err)
 	}
+}
+
+func mainKeyboard() tgbotapi.ReplyKeyboardMarkup {
+	return tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("📋 Мои товары"),
+		),
+	)
 }
