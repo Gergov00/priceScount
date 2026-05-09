@@ -58,7 +58,7 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		return
 	}
 
-	if msg.Text == "/mylist" {
+	if msg.Text == "/mylist" || msg.Text == "/pause" {
 		b.state.Clear(ctx, chatID)
 		b.handleMyList(ctx, chatID)
 		return
@@ -97,6 +97,12 @@ func (b *Bot) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
 		subID := strings.TrimPrefix(cb.Data, "edit_sub:")
 		b.api.Request(tgbotapi.NewDeleteMessage(chatID, cb.Message.MessageID))
 		b.startEditSubscription(ctx, chatID, subID)
+	case strings.HasPrefix(cb.Data, "pause_sub:"):
+		subID := strings.TrimPrefix(cb.Data, "pause_sub:")
+		b.pauseSubscription(ctx, chatID, cb.Message.MessageID, subID)
+	case strings.HasPrefix(cb.Data, "resume_sub:"):
+		subID := strings.TrimPrefix(cb.Data, "resume_sub:")
+		b.resumeSubscription(ctx, chatID, cb.Message.MessageID, subID)
 	case strings.HasPrefix(cb.Data, "del_sub:"):
 		subID := strings.TrimPrefix(cb.Data, "del_sub:")
 		b.deleteSubscription(ctx, chatID, cb.Message.MessageID, subID)

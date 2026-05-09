@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     max_price  NUMERIC(12,2),
     currency   VARCHAR(3)   NOT NULL DEFAULT 'RUB',
     active     BOOLEAN      NOT NULL DEFAULT TRUE,
+    paused     BOOLEAN      NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     UNIQUE(product_id, chat_id)
 );

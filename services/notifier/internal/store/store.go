@@ -74,6 +74,7 @@ func (s *Store) TriggeredSubscriptions(ctx context.Context, productID string, cu
 		JOIN products p ON p.id = s.product_id
 		WHERE s.product_id = $1
 		  AND s.active = true
+		  AND s.paused = false
 		  AND (
 		    (s.min_price IS NOT NULL AND $2 < s.min_price)
 		    OR (s.max_price IS NOT NULL AND $2 > s.max_price)
