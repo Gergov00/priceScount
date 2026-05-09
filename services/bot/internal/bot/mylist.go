@@ -215,6 +215,7 @@ func (b *Bot) handleForceCheck(ctx context.Context, chatID int64, subID string) 
 			ProductID:   productID,
 			URL:         u,
 			ScheduledAt: time.Now().UTC(),
+			Force:       true,
 		}
 		if err := b.broker.Publish(ctx, broker.QueueScraperTasks, task); err != nil {
 			slog.Error("force check publish failed", "url", u, "error", err)

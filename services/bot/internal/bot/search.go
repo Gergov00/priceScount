@@ -50,7 +50,19 @@ func (b *Bot) handleMinPrice(ctx context.Context, chatID int64, sess *state.Sess
 	sess.MinPrice = price
 	sess.Step = state.StepWaitingMaxPrice
 	b.state.Set(ctx, chatID, sess)
-	b.send(chatID, "Теперь укажи максимальную цену — уведомлю если цена вырастет выше.\n\nПример: 150000")
+
+	// Remind current prices when asking for max.
+	lines := make([]string, 0, len(sess.SelectedIdxs))
+	for _, idx := range sess.SelectedIdxs {
+		if idx < len(sess.URLs) && sess.URLs[idx].Price != "" {
+			lines = append(lines, "• "+sess.URLs[idx].Source+": "+sess.URLs[idx].Price)
+		}
+	}
+	hint := ""
+	if len(lines) > 0 {
+		hint = "Текущие цены:\n" + strings.Join(lines, "\n") + "\n\n"
+	}
+	b.send(chatID, hint+"Теперь укажи максимальную цену — уведомлю если цена вырастет выше.\n\nПример: 150000")
 }
 
 func (b *Bot) handleMaxPrice(ctx context.Context, chatID int64, sess *state.Session, text string) {
@@ -152,11 +164,16 @@ func (b *Bot) handleDone(ctx context.Context, chatID int64, cb *tgbotapi.Callbac
 	b.state.Set(ctx, chatID, sess)
 	b.api.Request(tgbotapi.NewDeleteMessage(chatID, cb.Message.MessageID))
 
-	// Show selected URLs so user can verify before entering price
+	// Show selected sources with current prices.
 	lines := make([]string, 0, len(sess.SelectedIdxs))
 	for _, idx := range sess.SelectedIdxs {
 		if idx < len(sess.URLs) {
-			lines = append(lines, "• "+sess.URLs[idx].URL)
+			item := sess.URLs[idx]
+			line := "• " + item.URL
+			if item.Price != "" {
+				line += "  (" + item.Price + ")"
+			}
+			lines = append(lines, line)
 		}
 	}
 	b.send(chatID, fmt.Sprintf(
