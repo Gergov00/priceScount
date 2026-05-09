@@ -73,6 +73,7 @@ func (b *Bot) handleMyList(ctx context.Context, chatID int64) {
 	}
 
 	msg := tgbotapi.NewMessage(chatID, sb.String())
+	msg.DisableWebPagePreview = true
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 	b.api.Send(msg)
 }

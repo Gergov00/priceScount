@@ -121,6 +121,7 @@ func (b *Bot) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
 
 func (b *Bot) send(chatID int64, text string) {
 	msg := tgbotapi.NewMessage(chatID, text)
+	msg.DisableWebPagePreview = true
 	if _, err := b.api.Send(msg); err != nil {
 		slog.Error("send message failed", "chat_id", chatID, "error", err)
 	}
