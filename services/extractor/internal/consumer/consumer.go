@@ -3,6 +3,7 @@ package consumer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -11,17 +12,27 @@ import (
 	"github.com/Gergov00/pricescount/shared/pkg/broker"
 	"github.com/Gergov00/pricescount/shared/pkg/contracts"
 	"github.com/Gergov00/pricescount/services/extractor/internal/dedup"
+	"github.com/Gergov00/pricescount/services/extractor/internal/headless"
 	"github.com/Gergov00/pricescount/services/extractor/internal/jsonld"
 	"github.com/Gergov00/pricescount/services/extractor/internal/llm"
 	"github.com/Gergov00/pricescount/services/extractor/internal/publisher"
 	"github.com/Gergov00/pricescount/services/extractor/internal/scraper"
 )
 
-// Consumer orchestrates: dedup check → fetch HTML → LLM extract → publish result.
+// Consumer orchestrates: dedup → fetch → extract price → publish result.
+//
+// Fetch strategy (in order):
+//  1. Regular HTTP scraper
+//  2. Headless browser (if HTTP returns access-denied)
+//
+// Extraction strategy (in order):
+//  1. JSON-LD structured data (no LLM cost)
+//  2. Groq LLM on raw HTML
 type Consumer struct {
 	conn      *broker.Connection
 	dedup     *dedup.Store
 	scraper   *scraper.Scraper
+	headless  *headless.Scraper
 	extractor *llm.Extractor
 	publisher *publisher.Publisher
 }
@@ -30,6 +41,7 @@ func New(
 	conn *broker.Connection,
 	dd *dedup.Store,
 	sc *scraper.Scraper,
+	hs *headless.Scraper,
 	ex *llm.Extractor,
 	pub *publisher.Publisher,
 ) *Consumer {
@@ -37,6 +49,7 @@ func New(
 		conn:      conn,
 		dedup:     dd,
 		scraper:   sc,
+		headless:  hs,
 		extractor: ex,
 		publisher: pub,
 	}
@@ -73,7 +86,6 @@ func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
 
 	log := slog.With("task_id", task.TaskID, "url", task.URL)
 
-	// Dedup check — skip if scraped recently.
 	dup, err := c.dedup.IsDuplicate(ctx, task.URL)
 	if err != nil {
 		log.Error("dedup check failed, requeuing", "error", err)
@@ -98,7 +110,6 @@ func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
 		return
 	}
 
-	// Mark as scraped regardless of success — avoids hammering a blocking site.
 	if err := c.dedup.Mark(ctx, task.URL); err != nil {
 		log.Error("failed to mark dedup, continuing", "error", err)
 	}
@@ -106,31 +117,36 @@ func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
 	d.Ack(false)
 }
 
-// process fetches the page and extracts the price. Always returns a result — on
-// failure it sets Success=false and populates Error.
-// Strategy: JSON-LD first (fast, no API cost), LLM as fallback.
 func (c *Consumer) process(ctx context.Context, task contracts.ScraperTask) contracts.PriceResult {
 	log := slog.With("task_id", task.TaskID, "url", task.URL)
 
+	// Step 1: fetch HTML.
 	html, err := c.scraper.Fetch(task.URL)
 	if err != nil {
-		log.Error("fetch failed", "error", err)
-		return contracts.PriceResult{Success: false, Error: err.Error()}
+		var denied *scraper.ErrAccessDenied
+		if errors.As(err, &denied) {
+			log.Info("HTTP blocked, retrying with headless browser", "status", denied.StatusCode)
+			html, err = c.headless.Fetch(task.URL)
+			if err != nil {
+				log.Error("headless fetch failed", "error", err)
+				return contracts.PriceResult{Success: false, Error: err.Error()}
+			}
+			log.Info("headless fetch succeeded")
+		} else {
+			log.Error("fetch failed", "error", err)
+			return contracts.PriceResult{Success: false, Error: err.Error()}
+		}
 	}
 
-	// 1. Try JSON-LD structured data — no LLM call needed.
+	// Step 2: try JSON-LD (free, fast).
 	if r, ok := jsonld.Extract(html); ok {
 		log.Info("price extracted via JSON-LD", "price", r.Price, "currency", r.Currency)
-		return contracts.PriceResult{
-			Success:  true,
-			Price:    r.Price,
-			Currency: r.Currency,
-		}
+		return contracts.PriceResult{Success: true, Price: r.Price, Currency: r.Currency}
 	}
 
 	log.Info("JSON-LD not found, falling back to LLM")
 
-	// 2. Fallback: send HTML to LLM.
+	// Step 3: LLM on raw HTML.
 	extracted, err := c.extractor.Extract(ctx, html)
 	if err != nil {
 		log.Error("price extraction failed", "error", err)
@@ -138,9 +154,5 @@ func (c *Consumer) process(ctx context.Context, task contracts.ScraperTask) cont
 	}
 
 	log.Info("price extracted via LLM", "price", extracted.Price, "currency", extracted.Currency)
-	return contracts.PriceResult{
-		Success:  true,
-		Price:    extracted.Price,
-		Currency: extracted.Currency,
-	}
+	return contracts.PriceResult{Success: true, Price: extracted.Price, Currency: extracted.Currency}
 }

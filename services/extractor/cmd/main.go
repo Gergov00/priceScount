@@ -10,6 +10,7 @@ import (
 	"github.com/Gergov00/pricescount/services/extractor/internal/config"
 	"github.com/Gergov00/pricescount/services/extractor/internal/consumer"
 	"github.com/Gergov00/pricescount/services/extractor/internal/dedup"
+	"github.com/Gergov00/pricescount/services/extractor/internal/headless"
 	"github.com/Gergov00/pricescount/services/extractor/internal/llm"
 	"github.com/Gergov00/pricescount/services/extractor/internal/publisher"
 	"github.com/Gergov00/pricescount/services/extractor/internal/scraper"
@@ -42,10 +43,18 @@ func main() {
 	}
 	defer dd.Close()
 
+	hs, err := headless.New()
+	if err != nil {
+		slog.Error("headless browser init failed", "error", err)
+		os.Exit(1)
+	}
+	defer hs.Close()
+
 	c := consumer.New(
 		conn,
 		dd,
 		scraper.New(),
+		hs,
 		llm.New(cfg.LLMAPIKey, cfg.LLMModel),
 		publisher.New(conn),
 	)

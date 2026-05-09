@@ -8,9 +8,19 @@ import (
 )
 
 const (
-	maxBodyBytes = 512 * 1024 // 512 KB — enough for any product page
+	maxBodyBytes = 512 * 1024
 	userAgent    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+
+// ErrAccessDenied is returned when the server blocks the request (401, 403, 498, etc.).
+// The consumer uses this to trigger a headless browser fallback.
+type ErrAccessDenied struct {
+	StatusCode int
+}
+
+func (e *ErrAccessDenied) Error() string {
+	return fmt.Sprintf("access denied (status %d)", e.StatusCode)
+}
 
 type Scraper struct {
 	client *http.Client
@@ -49,8 +59,10 @@ func (s *Scraper) Fetch(url string) (string, error) {
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
 		return "", fmt.Errorf("page not found (status %d)", resp.StatusCode)
 	}
-	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
-		return "", fmt.Errorf("access denied (status %d)", resp.StatusCode)
+	if resp.StatusCode == http.StatusForbidden ||
+		resp.StatusCode == http.StatusUnauthorized ||
+		resp.StatusCode == 498 { // Wildberries bot-detection code
+		return "", &ErrAccessDenied{StatusCode: resp.StatusCode}
 	}
 	if resp.StatusCode >= 400 {
 		return "", fmt.Errorf("unexpected status %d", resp.StatusCode)
