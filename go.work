@@ -1,0 +1,9 @@
+go 1.22.0
+
+use (
+	./shared
+	./services/discovery
+	./services/scheduler
+	./services/extractor
+	./services/notifier
+)
