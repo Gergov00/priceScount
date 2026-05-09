@@ -1,6 +1,7 @@
 go 1.26
 
 use (
+	./services/bot
 	./services/discovery
 	./services/extractor
 	./services/notifier

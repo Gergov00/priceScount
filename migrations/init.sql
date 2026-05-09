@@ -26,15 +26,17 @@ CREATE TABLE IF NOT EXISTS price_history (
     scraped_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
--- User alert subscriptions
+-- User alert subscriptions (one per product per Telegram chat)
 CREATE TABLE IF NOT EXISTS subscriptions (
-    id                   UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
-    product_id           UUID         NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-    user_id              TEXT         NOT NULL,
-    target_price         NUMERIC(12,2) NOT NULL,
-    notification_channel TEXT         NOT NULL DEFAULT 'telegram',
-    active               BOOLEAN      NOT NULL DEFAULT TRUE,
-    created_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    id         UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    product_id UUID         NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    chat_id    BIGINT       NOT NULL,
+    min_price  NUMERIC(12,2),
+    max_price  NUMERIC(12,2),
+    currency   VARCHAR(3)   NOT NULL DEFAULT 'RUB',
+    active     BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    UNIQUE(product_id, chat_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_tracked_urls_product_id  ON tracked_urls(product_id);

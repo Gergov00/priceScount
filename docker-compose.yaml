@@ -94,6 +94,25 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  bot:
+    build:
+      context: .
+      dockerfile: services/bot/Dockerfile
+    env_file:
+      - .env
+    environment:
+      DISCOVERY_URL: http://discovery:8081
+      REDIS_URL: redis://redis:6379
+      POSTGRES_DSN: postgresql://pricescount:pricescount@postgres:5432/pricescount?sslmode=disable
+    depends_on:
+      discovery:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
   notifier:
     build:
       context: .
