@@ -104,7 +104,10 @@ services:
       DISCOVERY_URL: http://discovery:8081
       REDIS_URL: redis://redis:6379
       POSTGRES_DSN: postgresql://pricescount:pricescount@postgres:5432/pricescount?sslmode=disable
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
     depends_on:
+      rabbitmq:
+        condition: service_healthy
       discovery:
         condition: service_started
       redis:

@@ -7,6 +7,7 @@ type Config struct {
 	DiscoveryURL  string
 	RedisURL      string
 	PostgresDSN   string
+	RabbitMQURL   string
 }
 
 func Load() Config {
@@ -15,6 +16,7 @@ func Load() Config {
 		DiscoveryURL:  getEnv("DISCOVERY_URL", "http://localhost:8081"),
 		RedisURL:      getEnv("REDIS_URL", "redis://localhost:6379"),
 		PostgresDSN:   getEnv("POSTGRES_DSN", "postgres://pricescount:pricescount@localhost:5434/pricescount?sslmode=disable"),
+		RabbitMQURL:   getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
 	}
 }
 

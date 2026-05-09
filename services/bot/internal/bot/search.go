@@ -86,6 +86,20 @@ func (b *Bot) handleMaxPrice(ctx context.Context, chatID int64, sess *state.Sess
 		return
 	}
 
+	// Save selected URLs to tracked_urls so they appear in /mylist immediately.
+	for _, idx := range sess.SelectedIdxs {
+		if idx < len(sess.URLs) {
+			item := sess.URLs[idx]
+			if _, err := b.db.Exec(ctx, `
+				INSERT INTO tracked_urls(product_id, url, source)
+				VALUES($1, $2, $3)
+				ON CONFLICT (url) DO NOTHING
+			`, sess.ProductID, item.URL, item.Source); err != nil {
+				slog.Error("insert tracked_url failed", "url", item.URL, "error", err)
+			}
+		}
+	}
+
 	b.state.Clear(ctx, chatID)
 
 	shops := make([]string, 0, len(sess.SelectedIdxs))

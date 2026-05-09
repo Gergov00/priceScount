@@ -9,6 +9,7 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Gergov00/pricescount/shared/pkg/broker"
 	"github.com/Gergov00/pricescount/services/bot/internal/discovery"
 	"github.com/Gergov00/pricescount/services/bot/internal/state"
 )
@@ -18,14 +19,15 @@ type Bot struct {
 	discovery *discovery.Client
 	state     *state.Store
 	db        *pgxpool.Pool
+	broker    *broker.Connection
 }
 
-func New(token string, dc *discovery.Client, st *state.Store, db *pgxpool.Pool) (*Bot, error) {
+func New(token string, dc *discovery.Client, st *state.Store, db *pgxpool.Pool, mq *broker.Connection) (*Bot, error) {
 	api, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		return nil, fmt.Errorf("bot api: %w", err)
 	}
-	return &Bot{api: api, discovery: dc, state: st, db: db}, nil
+	return &Bot{api: api, discovery: dc, state: st, db: db, broker: mq}, nil
 }
 
 func (b *Bot) Run(ctx context.Context) error {
@@ -108,6 +110,12 @@ func (b *Bot) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
 	case strings.HasPrefix(cb.Data, "del_sub:"):
 		subID := strings.TrimPrefix(cb.Data, "del_sub:")
 		b.deleteSubscription(ctx, chatID, cb.Message.MessageID, subID)
+	case strings.HasPrefix(cb.Data, "history_sub:"):
+		subID := strings.TrimPrefix(cb.Data, "history_sub:")
+		b.handleHistory(ctx, chatID, subID)
+	case strings.HasPrefix(cb.Data, "check_sub:"):
+		subID := strings.TrimPrefix(cb.Data, "check_sub:")
+		b.handleForceCheck(ctx, chatID, subID)
 	}
 }
 

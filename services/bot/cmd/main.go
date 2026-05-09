@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Gergov00/pricescount/shared/pkg/broker"
 	"github.com/Gergov00/pricescount/services/bot/internal/bot"
 	"github.com/Gergov00/pricescount/services/bot/internal/config"
 	"github.com/Gergov00/pricescount/services/bot/internal/discovery"
@@ -40,7 +41,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	b, err := bot.New(cfg.TelegramToken, discovery.New(cfg.DiscoveryURL), st, db)
+	mq, err := broker.ConnectWithRetry(cfg.RabbitMQURL, 10)
+	if err != nil {
+		slog.Error("rabbitmq unavailable", "error", err)
+		os.Exit(1)
+	}
+	defer mq.Close()
+
+	if err := mq.DeclareQueue(broker.QueueScraperTasks); err != nil {
+		slog.Error("declare queue failed", "error", err)
+		os.Exit(1)
+	}
+
+	b, err := bot.New(cfg.TelegramToken, discovery.New(cfg.DiscoveryURL), st, db, mq)
 	if err != nil {
 		slog.Error("bot init failed", "error", err)
 		os.Exit(1)
