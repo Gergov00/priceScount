@@ -1,27 +1,58 @@
 package alert
 
-import "log/slog"
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+)
 
 type Alert struct {
-	Channel     string
-	UserID      string
-	ProductID   string
+	ChatID      int64
+	ProductName string
 	URL         string
 	Price       float64
 	Currency    string
-	TargetPrice float64
+	MinPrice    *float64
+	MaxPrice    *float64
 }
 
-// Fire logs a price drop alert. Telegram and email are mocked as structured
-// log lines until real integrations are wired.
-func Fire(a Alert) {
-	slog.Info("PRICE ALERT",
-		"channel", a.Channel,
-		"user_id", a.UserID,
-		"product_id", a.ProductID,
-		"url", a.URL,
-		"price", a.Price,
-		"currency", a.Currency,
-		"target_price", a.TargetPrice,
+func Fire(token string, a Alert) {
+	text := buildText(a)
+	if err := sendTelegram(token, a.ChatID, text); err != nil {
+		slog.Error("telegram send failed", "chat_id", a.ChatID, "error", err)
+	}
+}
+
+func buildText(a Alert) string {
+	cur := a.Currency
+	if cur == "" {
+		cur = "₽"
+	}
+
+	if a.MinPrice != nil && a.Price < *a.MinPrice {
+		return fmt.Sprintf(
+			"📉 Цена упала!\n\n%s\n\nЦена: %.0f %s\nВаш минимум: %.0f %s\n\n%s",
+			a.ProductName, a.Price, cur, *a.MinPrice, cur, a.URL,
+		)
+	}
+	return fmt.Sprintf(
+		"📈 Цена выросла!\n\n%s\n\nЦена: %.0f %s\nВаш максимум: %.0f %s\n\n%s",
+		a.ProductName, a.Price, cur, *a.MaxPrice, cur, a.URL,
 	)
+}
+
+func sendTelegram(token string, chatID int64, text string) error {
+	body, _ := json.Marshal(map[string]any{
+		"chat_id": chatID,
+		"text":    text,
+	})
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
+	resp, err := http.Post(url, "application/json", bytes.NewReader(body)) //nolint:noctx
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
 }

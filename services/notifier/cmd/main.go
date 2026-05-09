@@ -40,7 +40,7 @@ func main() {
 	}
 	defer st.Close()
 
-	c := consumer.New(conn, st)
+	c := consumer.New(conn, st, cfg.TelegramToken)
 
 	go func() {
 		if err := c.Run(ctx); err != nil {

@@ -30,7 +30,6 @@ func (s *Store) Close() {
 
 // SavePrice upserts products + tracked_urls and inserts a price_history row.
 func (s *Store) SavePrice(ctx context.Context, productID, url string, price float64, currency string, scrapedAt time.Time) error {
-	// Upsert product — name is seeded from product_id until discovery writes the real name.
 	if _, err := s.pool.Exec(ctx, `
 		INSERT INTO products(id, name) VALUES($1, $2)
 		ON CONFLICT (id) DO NOTHING
@@ -38,7 +37,6 @@ func (s *Store) SavePrice(ctx context.Context, productID, url string, price floa
 		return fmt.Errorf("upsert product: %w", err)
 	}
 
-	// Upsert tracked_url → get its id.
 	var urlID string
 	if err := s.pool.QueryRow(ctx, `
 		INSERT INTO tracked_urls(product_id, url, source, last_checked_at)
@@ -61,20 +59,25 @@ func (s *Store) SavePrice(ctx context.Context, productID, url string, price floa
 
 type Subscription struct {
 	ID          string
-	UserID      string
-	Channel     string
-	TargetPrice float64
+	ChatID      int64
+	ProductName string
+	MinPrice    *float64
+	MaxPrice    *float64
 }
 
-// TriggeredSubscriptions returns active subscriptions for productID where
-// target_price >= currentPrice (i.e. the current price is at or below the target).
+// TriggeredSubscriptions returns active subscriptions where current price
+// falls outside the user's [min_price, max_price] range.
 func (s *Store) TriggeredSubscriptions(ctx context.Context, productID string, currentPrice float64) ([]Subscription, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, user_id, notification_channel, target_price
-		FROM subscriptions
-		WHERE product_id = $1
-		  AND active = true
-		  AND target_price >= $2
+		SELECT s.id, s.chat_id, p.name, s.min_price, s.max_price
+		FROM subscriptions s
+		JOIN products p ON p.id = s.product_id
+		WHERE s.product_id = $1
+		  AND s.active = true
+		  AND (
+		    (s.min_price IS NOT NULL AND $2 < s.min_price)
+		    OR (s.max_price IS NOT NULL AND $2 > s.max_price)
+		  )
 	`, productID, currentPrice)
 	if err != nil {
 		return nil, fmt.Errorf("query subscriptions: %w", err)
@@ -84,8 +87,8 @@ func (s *Store) TriggeredSubscriptions(ctx context.Context, productID string, cu
 	var subs []Subscription
 	for rows.Next() {
 		var sub Subscription
-		if err := rows.Scan(&sub.ID, &sub.UserID, &sub.Channel, &sub.TargetPrice); err != nil {
-			return nil, fmt.Errorf("scan subscription: %w", err)
+		if err := rows.Scan(&sub.ID, &sub.ChatID, &sub.ProductName, &sub.MinPrice, &sub.MaxPrice); err != nil {
+			return nil, fmt.Errorf("scan: %w", err)
 		}
 		subs = append(subs, sub)
 	}

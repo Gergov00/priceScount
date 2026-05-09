@@ -14,12 +14,13 @@ import (
 )
 
 type Consumer struct {
-	conn  *broker.Connection
-	store *store.Store
+	conn          *broker.Connection
+	store         *store.Store
+	telegramToken string
 }
 
-func New(conn *broker.Connection, st *store.Store) *Consumer {
-	return &Consumer{conn: conn, store: st}
+func New(conn *broker.Connection, st *store.Store, telegramToken string) *Consumer {
+	return &Consumer{conn: conn, store: st, telegramToken: telegramToken}
 }
 
 func (c *Consumer) Run(ctx context.Context) error {
@@ -69,21 +70,21 @@ func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
 	subs, err := c.store.TriggeredSubscriptions(ctx, result.ProductID, result.Price)
 	if err != nil {
 		log.Error("failed to query subscriptions", "error", err)
-		// Price is already saved — ack and move on.
 		d.Ack(false)
 		return
 	}
 
 	for _, sub := range subs {
-		alert.Fire(alert.Alert{
-			Channel:     sub.Channel,
-			UserID:      sub.UserID,
-			ProductID:   result.ProductID,
+		alert.Fire(c.telegramToken, alert.Alert{
+			ChatID:      sub.ChatID,
+			ProductName: sub.ProductName,
 			URL:         result.URL,
 			Price:       result.Price,
 			Currency:    result.Currency,
-			TargetPrice: sub.TargetPrice,
+			MinPrice:    sub.MinPrice,
+			MaxPrice:    sub.MaxPrice,
 		})
+		log.Info("alert fired", "chat_id", sub.ChatID, "product", sub.ProductName)
 	}
 
 	d.Ack(false)
