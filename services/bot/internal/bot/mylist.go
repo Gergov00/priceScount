@@ -36,6 +36,34 @@ func (b *Bot) handleMyList(ctx context.Context, chatID int64) {
 		return
 	}
 
+	text, keyboard := b.buildMyList(subs)
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.DisableWebPagePreview = true
+	msg.ReplyMarkup = keyboard
+	b.api.Send(msg)
+}
+
+// refreshMyList rewrites the existing mylist message in-place.
+func (b *Bot) refreshMyList(ctx context.Context, chatID int64, messageID int) {
+	subs, err := b.userSubscriptions(ctx, chatID)
+	if err != nil {
+		slog.Error("userSubscriptions failed on refresh", "error", err)
+		return
+	}
+	if len(subs) == 0 {
+		edit := tgbotapi.NewEditMessageText(chatID, messageID, "У тебя больше нет отслеживаемых товаров.\n\nНапиши название товара чтобы начать.")
+		b.api.Send(edit)
+		return
+	}
+
+	text, keyboard := b.buildMyList(subs)
+	editText := tgbotapi.NewEditMessageText(chatID, messageID, text)
+	editText.DisableWebPagePreview = true
+	b.api.Send(editText)
+	b.api.Send(tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, keyboard))
+}
+
+func (b *Bot) buildMyList(subs []subscription) (string, tgbotapi.InlineKeyboardMarkup) {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("📋 Твои товары (%d):\n", len(subs)))
 	for i, s := range subs {
@@ -52,9 +80,9 @@ func (b *Bot) handleMyList(ctx context.Context, chatID int64) {
 		}
 	}
 
-	rows := make([][]tgbotapi.InlineKeyboardButton, 0, len(subs)*2)
+	rows := make([][]tgbotapi.InlineKeyboardButton, 0, len(subs)*3)
 	for _, s := range subs {
-		name := truncate(s.Name, 18)
+		name := truncate(s.Name, 22)
 		pauseBtn := tgbotapi.NewInlineKeyboardButtonData("⏸", "pause_sub:"+s.ID)
 		if s.Paused {
 			pauseBtn = tgbotapi.NewInlineKeyboardButtonData("▶", "resume_sub:"+s.ID)
@@ -63,19 +91,18 @@ func (b *Bot) handleMyList(ctx context.Context, chatID int64) {
 			tgbotapi.NewInlineKeyboardRow(
 				tgbotapi.NewInlineKeyboardButtonData("✏️ "+name, "edit_sub:"+s.ID),
 				pauseBtn,
-				tgbotapi.NewInlineKeyboardButtonData("❌", "del_sub:"+s.ID),
 			),
 			tgbotapi.NewInlineKeyboardRow(
 				tgbotapi.NewInlineKeyboardButtonData("📊 История", "history_sub:"+s.ID),
 				tgbotapi.NewInlineKeyboardButtonData("🔄 Проверить", "check_sub:"+s.ID),
 			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("🗑 Удалить «"+truncate(s.Name, 20)+"»", "del_sub:"+s.ID),
+			),
 		)
 	}
 
-	msg := tgbotapi.NewMessage(chatID, sb.String())
-	msg.DisableWebPagePreview = true
-	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
-	b.api.Send(msg)
+	return sb.String(), tgbotapi.NewInlineKeyboardMarkup(rows...)
 }
 
 func (b *Bot) userSubscriptions(ctx context.Context, chatID int64) ([]subscription, error) {
@@ -127,7 +154,6 @@ func (b *Bot) productURLs(ctx context.Context, productID string) []string {
 	return urls
 }
 
-// handleHistory sends the last 15 price records for the subscription's product.
 func (b *Bot) handleHistory(ctx context.Context, chatID int64, subID string) {
 	var productID, productName string
 	err := b.db.QueryRow(ctx, `
@@ -172,7 +198,7 @@ func (b *Bot) handleHistory(ctx context.Context, chatID int64, subID string) {
 	}
 
 	if len(records) == 0 {
-		b.send(chatID, fmt.Sprintf("📊 %s\n\nИстория цен пока пуста — данные появятся после первой проверки.", productName))
+		b.send(chatID, fmt.Sprintf("📊 %s\n\nИстория цен пока пуста — нажми 🔄 Проверить чтобы получить первые данные.", productName))
 		return
 	}
 
@@ -189,7 +215,6 @@ func (b *Bot) handleHistory(ctx context.Context, chatID int64, subID string) {
 	b.send(chatID, sb.String())
 }
 
-// handleForceCheck publishes ScraperTask for every tracked URL of the subscription's product.
 func (b *Bot) handleForceCheck(ctx context.Context, chatID int64, subID string) {
 	var productID, productName string
 	err := b.db.QueryRow(ctx, `
@@ -231,13 +256,6 @@ func (b *Bot) handleForceCheck(ctx context.Context, chatID int64, subID string) 
 }
 
 func (b *Bot) pauseSubscription(ctx context.Context, chatID int64, messageID int, subID string) {
-	var name string
-	b.db.QueryRow(ctx, `
-		SELECT p.name FROM subscriptions s
-		JOIN products p ON p.id = s.product_id
-		WHERE s.id = $1 AND s.chat_id = $2
-	`, subID, chatID).Scan(&name)
-
 	if _, err := b.db.Exec(ctx,
 		`UPDATE subscriptions SET paused = true WHERE id = $1 AND chat_id = $2`,
 		subID, chatID,
@@ -246,19 +264,10 @@ func (b *Bot) pauseSubscription(ctx context.Context, chatID int64, messageID int
 		b.send(chatID, "Ошибка. Попробуй снова.")
 		return
 	}
-
-	b.api.Request(tgbotapi.NewDeleteMessage(chatID, messageID))
-	b.send(chatID, fmt.Sprintf("⏸ Отслеживание %q поставлено на паузу.\n\n/mylist — управление товарами", name))
+	b.refreshMyList(ctx, chatID, messageID)
 }
 
 func (b *Bot) resumeSubscription(ctx context.Context, chatID int64, messageID int, subID string) {
-	var name string
-	b.db.QueryRow(ctx, `
-		SELECT p.name FROM subscriptions s
-		JOIN products p ON p.id = s.product_id
-		WHERE s.id = $1 AND s.chat_id = $2
-	`, subID, chatID).Scan(&name)
-
 	if _, err := b.db.Exec(ctx,
 		`UPDATE subscriptions SET paused = false WHERE id = $1 AND chat_id = $2`,
 		subID, chatID,
@@ -267,19 +276,10 @@ func (b *Bot) resumeSubscription(ctx context.Context, chatID int64, messageID in
 		b.send(chatID, "Ошибка. Попробуй снова.")
 		return
 	}
-
-	b.api.Request(tgbotapi.NewDeleteMessage(chatID, messageID))
-	b.send(chatID, fmt.Sprintf("▶ Отслеживание %q возобновлено.\n\n/mylist — управление товарами", name))
+	b.refreshMyList(ctx, chatID, messageID)
 }
 
 func (b *Bot) deleteSubscription(ctx context.Context, chatID int64, messageID int, subID string) {
-	var name string
-	b.db.QueryRow(ctx, `
-		SELECT p.name FROM subscriptions s
-		JOIN products p ON p.id = s.product_id
-		WHERE s.id = $1 AND s.chat_id = $2
-	`, subID, chatID).Scan(&name)
-
 	if _, err := b.db.Exec(ctx,
 		`UPDATE subscriptions SET active = false WHERE id = $1 AND chat_id = $2`,
 		subID, chatID,
@@ -288,7 +288,5 @@ func (b *Bot) deleteSubscription(ctx context.Context, chatID int64, messageID in
 		b.send(chatID, "Ошибка удаления.")
 		return
 	}
-
-	b.api.Request(tgbotapi.NewDeleteMessage(chatID, messageID))
-	b.send(chatID, fmt.Sprintf("Удалено: %q\n\n/mylist — посмотреть оставшиеся товары", name))
+	b.refreshMyList(ctx, chatID, messageID)
 }
