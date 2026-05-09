@@ -28,7 +28,7 @@ func (b *Bot) handleSearch(ctx context.Context, chatID int64, productName string
 
 	urls := make([]state.URLItem, len(result.Items))
 	for i, item := range result.Items {
-		urls[i] = state.URLItem{URL: item.URL, Source: item.Source, Price: item.Price}
+		urls[i] = state.URLItem{URL: item.URL, Source: item.Source, Title: item.Title, Price: item.Price}
 	}
 
 	sess := &state.Session{
@@ -137,7 +137,24 @@ func (b *Bot) handleDone(ctx context.Context, chatID int64, cb *tgbotapi.Callbac
 	sess.Step = state.StepWaitingMinPrice
 	b.state.Set(ctx, chatID, sess)
 	b.api.Request(tgbotapi.NewDeleteMessage(chatID, cb.Message.MessageID))
-	b.send(chatID, "Укажи минимальную цену — уведомлю если цена упадёт ниже.\n\nПример: 80000")
+
+	// Show selected URLs so user can verify before entering price
+	lines := make([]string, 0, len(sess.SelectedIdxs))
+	for _, idx := range sess.SelectedIdxs {
+		if idx < len(sess.URLs) {
+			lines = append(lines, "• "+sess.URLs[idx].URL)
+		}
+	}
+	b.send(chatID, fmt.Sprintf(
+		"Выбраны источники:\n%s\n\nУкажи минимальную цену — уведомлю если цена упадёт ниже.\n\nПример: 80000",
+		strings.Join(lines, "\n"),
+	))
+}
+
+func (b *Bot) handleCancelSearch(ctx context.Context, chatID int64, messageID int) {
+	b.state.Clear(ctx, chatID)
+	b.api.Request(tgbotapi.NewDeleteMessage(chatID, messageID))
+	b.send(chatID, "Отменено. Напиши другое название товара.")
 }
 
 func (b *Bot) sendURLSelection(chatID int64, sess *state.Session) {
@@ -157,25 +174,46 @@ func (b *Bot) buildKeyboard(sess *state.Session) tgbotapi.InlineKeyboardMarkup {
 		selected[idx] = true
 	}
 
-	rows := make([][]tgbotapi.InlineKeyboardButton, 0, len(sess.URLs)+1)
+	rows := make([][]tgbotapi.InlineKeyboardButton, 0, len(sess.URLs)+2)
 	for i, item := range sess.URLs {
-		url := item.URL
-		if len(url) > 50 {
-			url = url[:50] + "…"
-		}
-		label := fmt.Sprintf("☐ %s", url)
-		if item.Price != "" {
-			label = fmt.Sprintf("☐ %s — %s", url, item.Price)
-		}
+		check := "☐"
 		if selected[i] {
-			label = "✅ " + label[len("☐ "):]
+			check = "✅"
 		}
+		label := fmt.Sprintf("%s %s", check, itemLabel(item))
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData(label, fmt.Sprintf("toggle:%d", i)),
 		))
 	}
-	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-		tgbotapi.NewInlineKeyboardButtonData("Готово ✅", "done"),
-	))
+	rows = append(rows,
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("✅ Готово", "done"),
+			tgbotapi.NewInlineKeyboardButtonData("🚫 Отмена", "cancel_search"),
+		),
+	)
 	return tgbotapi.NewInlineKeyboardMarkup(rows...)
+}
+
+// itemLabel builds a short human-readable label: "Shop — Title — Price"
+func itemLabel(item state.URLItem) string {
+	source := truncate(item.Source, 15)
+	title := truncate(item.Title, 25)
+	switch {
+	case title != "" && item.Price != "":
+		return fmt.Sprintf("%s — %s — %s", source, title, item.Price)
+	case title != "":
+		return fmt.Sprintf("%s — %s", source, title)
+	case item.Price != "":
+		return fmt.Sprintf("%s — %s", source, item.Price)
+	default:
+		return source
+	}
+}
+
+func truncate(s string, max int) string {
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max]) + "…"
 }

@@ -93,6 +93,8 @@ func (b *Bot) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
 		b.handleToggle(ctx, chatID, cb)
 	case cb.Data == "done":
 		b.handleDone(ctx, chatID, cb)
+	case cb.Data == "cancel_search":
+		b.handleCancelSearch(ctx, chatID, cb.Message.MessageID)
 	case strings.HasPrefix(cb.Data, "edit_sub:"):
 		subID := strings.TrimPrefix(cb.Data, "edit_sub:")
 		b.api.Request(tgbotapi.NewDeleteMessage(chatID, cb.Message.MessageID))

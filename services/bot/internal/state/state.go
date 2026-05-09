@@ -24,6 +24,7 @@ const (
 type URLItem struct {
 	URL    string `json:"url"`
 	Source string `json:"source"`
+	Title  string `json:"title"`
 	Price  string `json:"price"`
 }
 
