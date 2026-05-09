@@ -48,7 +48,7 @@ func (s *Scraper) Fetch(url string) (string, error) {
 	err := chromedp.Run(ctx,
 		chromedp.Navigate(url),
 		chromedp.WaitVisible(`body`, chromedp.ByQuery),
-		chromedp.Sleep(2*time.Second), // allow JS-rendered prices to appear
+		chromedp.Sleep(3*time.Second), // allow JS-rendered prices to appear
 		chromedp.OuterHTML(`html`, &html),
 	)
 	if err != nil {

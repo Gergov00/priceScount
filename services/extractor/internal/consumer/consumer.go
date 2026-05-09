@@ -3,7 +3,6 @@ package consumer
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -15,6 +14,7 @@ import (
 	"github.com/Gergov00/pricescount/services/extractor/internal/headless"
 	"github.com/Gergov00/pricescount/services/extractor/internal/jsonld"
 	"github.com/Gergov00/pricescount/services/extractor/internal/llm"
+	"github.com/Gergov00/pricescount/services/extractor/internal/nextdata"
 	"github.com/Gergov00/pricescount/services/extractor/internal/publisher"
 	"github.com/Gergov00/pricescount/services/extractor/internal/scraper"
 )
@@ -86,16 +86,18 @@ func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
 
 	log := slog.With("task_id", task.TaskID, "url", task.URL)
 
-	dup, err := c.dedup.IsDuplicate(ctx, task.URL)
-	if err != nil {
-		log.Error("dedup check failed, requeuing", "error", err)
-		d.Nack(false, true)
-		return
-	}
-	if dup {
-		log.Info("URL scraped recently, skipping")
-		d.Ack(false)
-		return
+	if !task.Force {
+		dup, err := c.dedup.IsDuplicate(ctx, task.URL)
+		if err != nil {
+			log.Error("dedup check failed, requeuing", "error", err)
+			d.Nack(false, true)
+			return
+		}
+		if dup {
+			log.Info("URL scraped recently, skipping")
+			d.Ack(false)
+			return
+		}
 	}
 
 	result := c.process(ctx, task)
@@ -120,39 +122,54 @@ func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
 func (c *Consumer) process(ctx context.Context, task contracts.ScraperTask) contracts.PriceResult {
 	log := slog.With("task_id", task.TaskID, "url", task.URL)
 
-	// Step 1: fetch HTML.
-	html, err := c.scraper.Fetch(task.URL)
-	if err != nil {
-		var denied *scraper.ErrAccessDenied
-		if errors.As(err, &denied) {
-			log.Info("HTTP blocked, retrying with headless browser", "status", denied.StatusCode)
-			html, err = c.headless.Fetch(task.URL)
-			if err != nil {
-				log.Error("headless fetch failed", "error", err)
-				return contracts.PriceResult{Success: false, Error: err.Error()}
-			}
-			log.Info("headless fetch succeeded")
-		} else {
-			log.Error("fetch failed", "error", err)
-			return contracts.PriceResult{Success: false, Error: err.Error()}
+	// Step 1: regular HTTP fetch.
+	html, httpErr := c.scraper.Fetch(task.URL)
+	if httpErr != nil {
+		log.Info("HTTP fetch failed, trying headless", "error", httpErr)
+	} else {
+		// Step 2: extract from HTTP response (JSON-LD → __NEXT_DATA__ → LLM).
+		if result, ok := c.extractFromHTML(ctx, log, html, "http"); ok {
+			return result
 		}
+		log.Info("price not found via HTTP, trying headless")
 	}
 
-	// Step 2: try JSON-LD (free, fast).
-	if r, ok := jsonld.Extract(html); ok {
-		log.Info("price extracted via JSON-LD", "price", r.Price, "currency", r.Currency)
-		return contracts.PriceResult{Success: true, Price: r.Price, Currency: r.Currency}
-	}
-
-	log.Info("JSON-LD not found, falling back to LLM")
-
-	// Step 3: LLM on raw HTML.
-	extracted, err := c.extractor.Extract(ctx, html)
+	// Step 3: headless Chrome fallback (handles JS-rendered pages, TLS blocks, access denied).
+	headlessHTML, err := c.headless.Fetch(task.URL)
 	if err != nil {
-		log.Error("price extraction failed", "error", err)
-		return contracts.PriceResult{Success: false, Error: err.Error()}
+		log.Error("headless fetch failed", "error", err)
+		errMsg := err.Error()
+		if httpErr != nil {
+			errMsg = fmt.Sprintf("http: %s; headless: %s", httpErr, err)
+		}
+		return contracts.PriceResult{Success: false, Error: errMsg}
+	}
+	log.Info("headless fetch succeeded")
+
+	if result, ok := c.extractFromHTML(ctx, log, headlessHTML, "headless"); ok {
+		return result
 	}
 
-	log.Info("price extracted via LLM", "price", extracted.Price, "currency", extracted.Currency)
-	return contracts.PriceResult{Success: true, Price: extracted.Price, Currency: extracted.Currency}
+	return contracts.PriceResult{Success: false, Error: "all extraction methods exhausted"}
+}
+
+// extractFromHTML tries JSON-LD → __NEXT_DATA__ → LLM in order.
+func (c *Consumer) extractFromHTML(ctx context.Context, log *slog.Logger, html, source string) (contracts.PriceResult, bool) {
+	if r, ok := jsonld.Extract(html); ok {
+		log.Info("price extracted via JSON-LD", "source", source, "price", r.Price, "currency", r.Currency)
+		return contracts.PriceResult{Success: true, Price: r.Price, Currency: r.Currency}, true
+	}
+
+	if r, ok := nextdata.Extract(html); ok {
+		log.Info("price extracted via __NEXT_DATA__", "source", source, "price", r.Price, "currency", r.Currency)
+		return contracts.PriceResult{Success: true, Price: r.Price, Currency: r.Currency}, true
+	}
+
+	extracted, err := c.extractor.Extract(ctx, html)
+	if err == nil {
+		log.Info("price extracted via LLM", "source", source, "price", extracted.Price, "currency", extracted.Currency)
+		return contracts.PriceResult{Success: true, Price: extracted.Price, Currency: extracted.Currency}, true
+	}
+	log.Info("LLM extraction failed", "source", source, "error", err)
+	return contracts.PriceResult{}, false
 }

@@ -17,6 +17,7 @@ type ScraperTask struct {
 	ProductID   string    `json:"product_id"`
 	URL         string    `json:"url"`
 	ScheduledAt time.Time `json:"scheduled_at"`
+	Force       bool      `json:"force,omitempty"` // skip dedup cache when true
 }
 
 // PriceResult is published to the price.results queue by the Extractor Service.
