@@ -164,7 +164,8 @@ func (a *Agent) shoppingSearch(ctx context.Context, query, gl, hl string) ([]Res
 	seen := make(map[string]struct{})
 	results := make([]Result, 0, len(sr.Shopping))
 	for _, item := range sr.Shopping {
-		if item.Link == "" {
+		if item.Link == "" || strings.HasPrefix(item.Link, "https://www.google.com/") {
+			// Google Shopping redirect — not a scrapable merchant URL.
 			continue
 		}
 		if _, dup := seen[item.Link]; dup {
@@ -184,7 +185,13 @@ func (a *Agent) shoppingSearch(ctx context.Context, query, gl, hl string) ([]Res
 // organicSearch is a fallback that uses the regular /search endpoint
 // and applies a basic heuristic to keep likely product pages.
 func (a *Agent) organicSearch(ctx context.Context, query, gl, hl string) ([]Result, error) {
-	payload := map[string]any{"q": fmt.Sprintf("buy %s price", query), "gl": gl, "hl": hl, "num": 20}
+	var q string
+	if hl == "ru" {
+		q = fmt.Sprintf("%s купить цена", query)
+	} else {
+		q = fmt.Sprintf("buy %s price", query)
+	}
+	payload := map[string]any{"q": q, "gl": gl, "hl": hl, "num": 20}
 	body, _ := json.Marshal(payload)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://google.serper.dev/search", bytes.NewReader(body))
@@ -221,8 +228,7 @@ func (a *Agent) organicSearch(ctx context.Context, query, gl, hl string) ([]Resu
 			continue
 		}
 		seen[item.Link] = struct{}{}
-		// Skip obvious non-shop pages.
-		if isNonShopURL(item.Link) {
+		if isNonShopURL(item.Link) || isCatalogURL(item.Link) {
 			continue
 		}
 		results = append(results, Result{
@@ -240,6 +246,7 @@ var nonShopKeywords = []string{
 	"twitter.com", "instagram.com", "tiktok.com",
 	"gsmarena.com", "rtings.com", "techradar.com", "theverge.com",
 	"tomshardware.com", "anandtech.com", "ixbt.com", "3dnews.ru",
+	"obzor", "review", "otzyv",
 }
 
 func isNonShopURL(rawURL string) bool {
@@ -248,6 +255,38 @@ func isNonShopURL(rawURL string) bool {
 		if strings.Contains(lower, kw) {
 			return true
 		}
+	}
+	return false
+}
+
+// catalogSegments are URL path segments that indicate a category/listing page.
+var catalogSegments = []string{
+	"/catalog/", "/category/", "/categories/", "/collection/",
+	"/collections/", "/cat/", "/c/", "/search", "?q=", "&q=",
+	"/brand/", "/brands/", "/tag/", "/tags/", "/product-tag/",
+	"/filter/", "/sort/", "/page/",
+}
+
+func isCatalogURL(rawURL string) bool {
+	lower := strings.ToLower(rawURL)
+	for _, seg := range catalogSegments {
+		if strings.Contains(lower, seg) {
+			return true
+		}
+	}
+	// URL ends with just a domain or a very short path — likely a homepage or brand page.
+	path := lower
+	if i := strings.Index(path, "://"); i != -1 {
+		path = path[i+3:]
+	}
+	if i := strings.IndexByte(path, '/'); i != -1 {
+		path = path[i:]
+	} else {
+		return true // no path at all
+	}
+	// Strip trailing slash and check if path is empty or just "/"
+	if path == "/" || path == "" {
+		return true
 	}
 	return false
 }
