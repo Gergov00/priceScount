@@ -78,18 +78,21 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # extractor:
-  #   build:
-  #     context: .
-  #     dockerfile: services/extractor/Dockerfile
-  #   env_file: [.env]
-  #   environment:
-  #     RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-  #     REDIS_URL: redis://redis:6379
-  #   depends_on:
-  #     rabbitmq: { condition: service_healthy }
-  #     redis:    { condition: service_healthy }
-  #   restart: unless-stopped
+  extractor:
+    build:
+      context: .
+      dockerfile: services/extractor/Dockerfile
+    env_file:
+      - .env
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
   # notifier:
   #   build:
