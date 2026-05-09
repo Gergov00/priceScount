@@ -9,6 +9,7 @@ COPY services/discovery/go.mod  services/discovery/go.mod
 COPY services/scheduler/go.mod  services/scheduler/go.mod
 COPY services/extractor/go.mod  services/extractor/go.mod
 COPY services/notifier/go.mod   services/notifier/go.mod
+COPY services/bot/go.mod        services/bot/go.mod
 RUN go work sync
 
 COPY shared/   shared/
