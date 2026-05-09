@@ -1,6 +1,6 @@
 # Build context must be the repository root:
 #   docker build -f services/discovery/Dockerfile .
-FROM golang:1.22-alpine AS builder
+FROM golang:1.26-alpine AS builder
 WORKDIR /build
 
 # Copy workspace manifest and all module descriptors so the dependency

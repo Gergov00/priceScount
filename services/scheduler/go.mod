@@ -1,6 +1,6 @@
 module github.com/Gergov00/pricescount/services/scheduler
 
-go 1.22.0
+go 1.26
 
 require (
 	github.com/Gergov00/pricescount/shared v0.0.0-00010101000000-000000000000

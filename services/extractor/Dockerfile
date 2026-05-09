@@ -1,6 +1,6 @@
 # Build context must be the repository root:
 #   docker build -f services/extractor/Dockerfile .
-FROM golang:1.22-alpine AS builder
+FROM golang:1.26-alpine AS builder
 WORKDIR /build
 
 COPY go.work* ./
@@ -17,6 +17,7 @@ WORKDIR /build/services/extractor
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /bin/extractor ./cmd/
 
 FROM alpine:3.19
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata chromium
+ENV CHROMIUM_PATH=/usr/bin/chromium-browser
 COPY --from=builder /bin/extractor /bin/extractor
 ENTRYPOINT ["/bin/extractor"]
