@@ -11,7 +11,6 @@ import (
 
 const (
 	StepIdle            = "idle"
-	StepSelectingURLs   = "selecting_urls"
 	StepWaitingMinPrice = "waiting_min_price"
 	StepWaitingMaxPrice = "waiting_max_price"
 	StepEditingMinPrice = "editing_min_price"
@@ -21,21 +20,15 @@ const (
 	ttl       = 30 * time.Minute
 )
 
-type URLItem struct {
-	URL    string `json:"url"`
-	Source string `json:"source"`
-	Title  string `json:"title"`
-	Price  string `json:"price"`
-}
-
 type Session struct {
-	Step         string    `json:"step"`
-	ProductID    string    `json:"product_id"`
-	ProductName  string    `json:"product_name"`
-	URLs         []URLItem `json:"urls"`
-	SelectedIdxs []int     `json:"selected_idxs"`
-	MinPrice     float64   `json:"min_price"`
-	// used during edit flow
+	Step         string  `json:"step"`
+	ProductID    string  `json:"product_id"`
+	ProductName  string  `json:"product_name"`
+	URL          string  `json:"url"`
+	Platform     string  `json:"platform"`      // "wb" or "ozon"
+	CurrentPrice float64 `json:"current_price"` // shown as reference when setting thresholds
+	MinPrice     float64 `json:"min_price"`
+	// edit flow
 	EditingSubID string  `json:"editing_sub_id,omitempty"`
 	OldMinPrice  float64 `json:"old_min_price,omitempty"`
 	OldMaxPrice  float64 `json:"old_max_price,omitempty"`

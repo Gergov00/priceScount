@@ -47,16 +47,16 @@ func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
 	var msg contracts.DiscoveredURL
 	if err := json.Unmarshal(d.Body, &msg); err != nil {
 		slog.Error("malformed message, dropping", "error", err, "body", string(d.Body))
-		d.Nack(false, false) // don't requeue malformed messages
+		d.Nack(false, false)
 		return
 	}
 
-	if err := c.store.Add(ctx, msg.URL, msg.ProductID); err != nil {
+	if err := c.store.Add(ctx, msg.URL, msg.ProductID, msg.Platform); err != nil {
 		slog.Error("failed to register URL in pool, requeuing", "url", msg.URL, "error", err)
-		d.Nack(false, true) // requeue on transient Redis failure
+		d.Nack(false, true)
 		return
 	}
 
-	slog.Info("URL registered in pool", "url", msg.URL, "product", msg.ProductName, "product_id", msg.ProductID)
+	slog.Info("URL registered in pool", "url", msg.URL, "product", msg.ProductName, "platform", msg.Platform)
 	d.Ack(false)
 }

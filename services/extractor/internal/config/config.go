@@ -2,25 +2,33 @@ package config
 
 import (
 	"os"
+	"strconv"
 	"time"
 )
 
 type Config struct {
 	RabbitMQURL string
 	RedisURL    string
-	LLMAPIKey   string
-	LLMModel    string
-	ScrapedTTL  time.Duration // dedup window — skip re-scraping within this period
+	ScrapedTTL  time.Duration
 }
 
 func Load() Config {
 	return Config{
 		RabbitMQURL: getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
 		RedisURL:    getEnv("REDIS_URL", "redis://localhost:6379"),
-		LLMAPIKey:   getEnv("LLM_API_KEY", ""),
-		LLMModel:    getEnv("LLM_MODEL", "llama-3.3-70b-versatile"),
-		ScrapedTTL:  time.Hour,
+		ScrapedTTL:  checkInterval(),
 	}
+}
+
+// checkInterval reads CHECK_INTERVAL_MINUTES (shared with the scheduler service)
+// so the dedup TTL stays in sync with how often the scheduler fires.
+func checkInterval() time.Duration {
+	if v := os.Getenv("CHECK_INTERVAL_MINUTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Minute
+		}
+	}
+	return time.Hour
 }
 
 func getEnv(key, fallback string) string {

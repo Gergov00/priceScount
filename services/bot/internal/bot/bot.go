@@ -5,29 +5,42 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Gergov00/pricescount/shared/pkg/broker"
-	"github.com/Gergov00/pricescount/services/bot/internal/discovery"
+	"github.com/Gergov00/pricescount/shared/pkg/marketplace"
 	"github.com/Gergov00/pricescount/services/bot/internal/state"
 )
 
 type Bot struct {
-	api       *tgbotapi.BotAPI
-	discovery *discovery.Client
-	state     *state.Store
-	db        *pgxpool.Pool
-	broker    *broker.Connection
+	api    *tgbotapi.BotAPI
+	wb     *marketplace.WBClient
+	ozon   *marketplace.OzonClient
+	state  *state.Store
+	db     *pgxpool.Pool
+	broker *broker.Connection
 }
 
-func New(token string, dc *discovery.Client, st *state.Store, db *pgxpool.Pool, mq *broker.Connection) (*Bot, error) {
+func (b *Bot) Close() {
+	b.wb.Close()
+}
+
+func New(token string, st *state.Store, db *pgxpool.Pool, mq *broker.Connection) (*Bot, error) {
 	api, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		return nil, fmt.Errorf("bot api: %w", err)
 	}
-	b := &Bot{api: api, discovery: dc, state: st, db: db, broker: mq}
+	b := &Bot{
+		api:    api,
+		wb:     marketplace.NewWBClient(),
+		ozon:   marketplace.NewOzonClient(),
+		state:  st,
+		db:     db,
+		broker: mq,
+	}
 	b.registerCommands()
 	return b, nil
 }
@@ -35,7 +48,6 @@ func New(token string, dc *discovery.Client, st *state.Store, db *pgxpool.Pool, 
 func (b *Bot) registerCommands() {
 	commands := []tgbotapi.BotCommand{
 		{Command: "mylist", Description: "Мои отслеживаемые товары"},
-		{Command: "pause", Description: "Управление паузой"},
 		{Command: "cancel", Description: "Отменить текущее действие"},
 	}
 	b.api.Request(tgbotapi.NewSetMyCommands(commands...))
@@ -67,13 +79,15 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 
 	if msg.Text == "/start" || msg.Text == "/cancel" {
 		b.state.Clear(ctx, chatID)
-		reply := tgbotapi.NewMessage(chatID, "Привет! Напиши название товара, который хочешь отслеживать.\n\nПример: iPhone 15 Pro")
+		reply := tgbotapi.NewMessage(chatID,
+			"Привет! Пришли ссылку на товар с Wildberries или Ozon — я начну следить за ценой.\n\n"+
+				"Пример:\nhttps://www.wildberries.ru/catalog/12345678/detail.aspx")
 		reply.ReplyMarkup = mainKeyboard()
 		b.api.Send(reply)
 		return
 	}
 
-	if msg.Text == "/mylist" || msg.Text == "/pause" || msg.Text == "📋 Мои товары" {
+	if msg.Text == "/mylist" || msg.Text == "📋 Мои товары" {
 		b.state.Clear(ctx, chatID)
 		b.handleMyList(ctx, chatID)
 		return
@@ -87,7 +101,7 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 
 	switch sess.Step {
 	case state.StepIdle:
-		b.handleSearch(ctx, chatID, msg.Text)
+		b.handleURLSubmit(ctx, chatID, msg.Text)
 	case state.StepWaitingMinPrice:
 		b.handleMinPrice(ctx, chatID, sess, msg.Text)
 	case state.StepWaitingMaxPrice:
@@ -104,12 +118,6 @@ func (b *Bot) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
 	b.api.Request(tgbotapi.NewCallback(cb.ID, ""))
 
 	switch {
-	case strings.HasPrefix(cb.Data, "toggle:"):
-		b.handleToggle(ctx, chatID, cb)
-	case cb.Data == "done":
-		b.handleDone(ctx, chatID, cb)
-	case cb.Data == "cancel_search":
-		b.handleCancelSearch(ctx, chatID, cb.Message.MessageID)
 	case strings.HasPrefix(cb.Data, "edit_sub:"):
 		subID := strings.TrimPrefix(cb.Data, "edit_sub:")
 		b.api.Request(tgbotapi.NewDeleteMessage(chatID, cb.Message.MessageID))
@@ -135,8 +143,18 @@ func (b *Bot) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
 func (b *Bot) send(chatID int64, text string) {
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.DisableWebPagePreview = true
-	if _, err := b.api.Send(msg); err != nil {
-		slog.Error("send message failed", "chat_id", chatID, "error", err)
+	delays := []time.Duration{0, 3 * time.Second, 6 * time.Second, 12 * time.Second}
+	for _, d := range delays {
+		if d > 0 {
+			time.Sleep(d)
+		}
+		if _, err := b.api.Send(msg); err == nil {
+			return
+		} else if d == delays[len(delays)-1] {
+			slog.Error("send message failed", "chat_id", chatID, "error", err)
+		} else {
+			slog.Warn("send message attempt failed, retrying", "chat_id", chatID, "error", err)
+		}
 	}
 }
 

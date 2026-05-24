@@ -96,6 +96,33 @@ func (s *Store) TriggeredSubscriptions(ctx context.Context, productID string, cu
 	return subs, rows.Err()
 }
 
+// ActiveSubscriptions returns all active non-paused subscriptions for a product.
+// Used when a force check result arrives — notify regardless of price thresholds.
+func (s *Store) ActiveSubscriptions(ctx context.Context, productID string) ([]Subscription, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT s.id, s.chat_id, p.name, s.min_price, s.max_price
+		FROM subscriptions s
+		JOIN products p ON p.id = s.product_id
+		WHERE s.product_id = $1
+		  AND s.active = true
+		  AND s.paused = false
+	`, productID)
+	if err != nil {
+		return nil, fmt.Errorf("query active subscriptions: %w", err)
+	}
+	defer rows.Close()
+
+	var subs []Subscription
+	for rows.Next() {
+		var sub Subscription
+		if err := rows.Scan(&sub.ID, &sub.ChatID, &sub.ProductName, &sub.MinPrice, &sub.MaxPrice); err != nil {
+			return nil, fmt.Errorf("scan: %w", err)
+		}
+		subs = append(subs, sub)
+	}
+	return subs, rows.Err()
+}
+
 func domainOf(rawURL string) string {
 	s := strings.TrimPrefix(strings.TrimPrefix(rawURL, "https://"), "http://")
 	s = strings.TrimPrefix(s, "www.")

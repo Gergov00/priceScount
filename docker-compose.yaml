@@ -45,22 +45,6 @@ services:
       retries: 10
       start_period: 20s
 
-  discovery:
-    build:
-      context: .
-      dockerfile: services/discovery/Dockerfile
-    ports:
-      - "8081:8081"
-    env_file:
-      - .env
-    environment:
-      PORT: "8081"
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
-    restart: unless-stopped
-
   scheduler:
     build:
       context: .
@@ -70,7 +54,7 @@ services:
     environment:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       REDIS_URL: redis://redis:6379
-      CHECK_INTERVAL_MINUTES: "60"
+      CHECK_INTERVAL_MINUTES: "1"
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -87,6 +71,7 @@ services:
     environment:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       REDIS_URL: redis://redis:6379
+      CHECK_INTERVAL_MINUTES: "1"
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -101,15 +86,12 @@ services:
     env_file:
       - .env
     environment:
-      DISCOVERY_URL: http://discovery:8081
       REDIS_URL: redis://redis:6379
       POSTGRES_DSN: postgresql://pricescount:pricescount@postgres:5432/pricescount?sslmode=disable
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
     depends_on:
       rabbitmq:
         condition: service_healthy
-      discovery:
-        condition: service_started
       redis:
         condition: service_healthy
       postgres:

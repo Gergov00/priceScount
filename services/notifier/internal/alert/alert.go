@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 )
 
 type Alert struct {
@@ -20,7 +21,19 @@ type Alert struct {
 
 func Fire(token string, a Alert) {
 	text := buildText(a)
-	if err := sendTelegram(token, a.ChatID, text); err != nil {
+	if err := sendWithRetry(token, a.ChatID, text); err != nil {
+		slog.Error("telegram send failed", "chat_id", a.ChatID, "error", err)
+	}
+}
+
+// FireCurrent sends a plain "current price" message for force-check results.
+func FireCurrent(token string, a Alert) {
+	cur := a.Currency
+	if cur == "" {
+		cur = "₽"
+	}
+	text := fmt.Sprintf("💰 Текущая цена: %.0f %s\n\n%s\n%s", a.Price, cur, a.ProductName, a.URL)
+	if err := sendWithRetry(token, a.ChatID, text); err != nil {
 		slog.Error("telegram send failed", "chat_id", a.ChatID, "error", err)
 	}
 }
@@ -41,6 +54,22 @@ func buildText(a Alert) string {
 		"📈 Цена выросла!\n\n%s\n\nЦена: %.0f %s\nВаш максимум: %.0f %s\n\n%s",
 		a.ProductName, a.Price, cur, *a.MaxPrice, cur, a.URL,
 	)
+}
+
+// sendWithRetry tries up to 4 times with 3s, 6s, 12s backoff.
+func sendWithRetry(token string, chatID int64, text string) error {
+	delays := []time.Duration{0, 3 * time.Second, 6 * time.Second, 12 * time.Second}
+	var lastErr error
+	for _, d := range delays {
+		if d > 0 {
+			time.Sleep(d)
+		}
+		if lastErr = sendTelegram(token, chatID, text); lastErr == nil {
+			return nil
+		}
+		slog.Warn("telegram send attempt failed, retrying", "chat_id", chatID, "error", lastErr)
+	}
+	return lastErr
 }
 
 func sendTelegram(token string, chatID int64, text string) error {

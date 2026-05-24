@@ -12,12 +12,11 @@ import (
 	"github.com/Gergov00/pricescount/shared/pkg/broker"
 	"github.com/Gergov00/pricescount/services/bot/internal/bot"
 	"github.com/Gergov00/pricescount/services/bot/internal/config"
-	"github.com/Gergov00/pricescount/services/bot/internal/discovery"
 	"github.com/Gergov00/pricescount/services/bot/internal/state"
 )
 
 func main() {
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	cfg := config.Load()
 	if cfg.TelegramToken == "" {
@@ -48,16 +47,21 @@ func main() {
 	}
 	defer mq.Close()
 
+	if err := mq.DeclareQueue(broker.QueueDiscoveryURLs); err != nil {
+		slog.Error("declare queue failed", "error", err)
+		os.Exit(1)
+	}
 	if err := mq.DeclareQueue(broker.QueueScraperTasks); err != nil {
 		slog.Error("declare queue failed", "error", err)
 		os.Exit(1)
 	}
 
-	b, err := bot.New(cfg.TelegramToken, discovery.New(cfg.DiscoveryURL), st, db, mq)
+	b, err := bot.New(cfg.TelegramToken, st, db, mq)
 	if err != nil {
 		slog.Error("bot init failed", "error", err)
 		os.Exit(1)
 	}
+	defer b.Close()
 
 	go func() {
 		if err := b.Run(ctx); err != nil {

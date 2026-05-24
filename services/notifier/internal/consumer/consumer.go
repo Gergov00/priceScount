@@ -67,6 +67,27 @@ func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
 
 	log.Info("price saved", "price", result.Price, "currency", result.Currency)
 
+	if result.Force {
+		subs, err := c.store.ActiveSubscriptions(ctx, result.ProductID)
+		if err != nil {
+			log.Error("failed to query active subscriptions", "error", err)
+			d.Ack(false)
+			return
+		}
+		for _, sub := range subs {
+			alert.FireCurrent(c.telegramToken, alert.Alert{
+				ChatID:      sub.ChatID,
+				ProductName: sub.ProductName,
+				URL:         result.URL,
+				Price:       result.Price,
+				Currency:    result.Currency,
+			})
+			log.Info("force check result sent", "chat_id", sub.ChatID, "product", sub.ProductName)
+		}
+		d.Ack(false)
+		return
+	}
+
 	subs, err := c.store.TriggeredSubscriptions(ctx, result.ProductID, result.Price)
 	if err != nil {
 		log.Error("failed to query subscriptions", "error", err)

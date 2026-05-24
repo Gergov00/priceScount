@@ -4,20 +4,22 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-// URLMeta holds a URL and its associated product ID, retrieved together when dispatching.
+// URLMeta holds a URL and its scheduling metadata.
 type URLMeta struct {
 	URL       string
 	ProductID string
+	Platform  string // "wb" or "ozon"
 }
 
 // URLStore manages the URL pool using two Redis structures:
 //   - Sorted set (setKey):  member=url, score=next_check_unix_timestamp
-//   - Hash      (metaKey):  field=url,  value=product_id
+//   - Hash      (metaKey):  field=url,  value="productID|platform"
 type URLStore struct {
 	client  *redis.Client
 	setKey  string
@@ -40,10 +42,8 @@ func (s *URLStore) Ping(ctx context.Context) error {
 	return s.client.Ping(ctx).Err()
 }
 
-// Add registers a URL in the pool.
-// ZADD NX ensures the URL is only added once (deduplication).
-// The score is set to now so it gets checked on the very next tick.
-func (s *URLStore) Add(ctx context.Context, url, productID string) error {
+// Add registers a URL in the pool with ZADD NX (dedup).
+func (s *URLStore) Add(ctx context.Context, url, productID, platform string) error {
 	added, err := s.client.ZAddNX(ctx, s.setKey, redis.Z{
 		Score:  float64(time.Now().Unix()),
 		Member: url,
@@ -55,8 +55,9 @@ func (s *URLStore) Add(ctx context.Context, url, productID string) error {
 		slog.Debug("URL already in pool, skipping", "url", url)
 		return nil
 	}
-	// Store product_id only for newly added URLs.
-	if err := s.client.HSet(ctx, s.metaKey, url, productID).Err(); err != nil {
+	// Store "productID|platform" so the scheduler can pass Platform to ScraperTask.
+	meta := productID + "|" + platform
+	if err := s.client.HSet(ctx, s.metaKey, url, meta).Err(); err != nil {
 		return fmt.Errorf("hset meta: %w", err)
 	}
 	return nil
@@ -78,8 +79,9 @@ func (s *URLStore) DueURLs(ctx context.Context) ([]URLMeta, error) {
 
 	metas := make([]URLMeta, 0, len(urls))
 	for _, url := range urls {
-		productID, _ := s.client.HGet(ctx, s.metaKey, url).Result()
-		metas = append(metas, URLMeta{URL: url, ProductID: productID})
+		raw, _ := s.client.HGet(ctx, s.metaKey, url).Result()
+		productID, platform := splitMeta(raw)
+		metas = append(metas, URLMeta{URL: url, ProductID: productID, Platform: platform})
 	}
 	return metas, nil
 }
@@ -95,4 +97,12 @@ func (s *URLStore) Reschedule(ctx context.Context, url string, interval time.Dur
 
 func (s *URLStore) Close() error {
 	return s.client.Close()
+}
+
+// splitMeta parses "productID|platform" stored in the meta hash.
+func splitMeta(raw string) (productID, platform string) {
+	if idx := strings.IndexByte(raw, '|'); idx >= 0 {
+		return raw[:idx], raw[idx+1:]
+	}
+	return raw, ""
 }

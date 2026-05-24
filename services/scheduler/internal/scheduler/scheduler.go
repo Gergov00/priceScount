@@ -23,7 +23,6 @@ func New(conn *broker.Connection, st *store.URLStore, interval time.Duration) *S
 }
 
 // Run starts the tick loop. It dispatches immediately on start, then every interval.
-// Blocks until ctx is cancelled.
 func (s *Scheduler) Run(ctx context.Context) error {
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
@@ -60,12 +59,12 @@ func (s *Scheduler) dispatch(ctx context.Context) {
 			TaskID:      uuid.New().String(),
 			ProductID:   meta.ProductID,
 			URL:         meta.URL,
+			Platform:    meta.Platform,
 			ScheduledAt: time.Now().UTC(),
 		}
 
 		if err := s.conn.Publish(ctx, broker.QueueScraperTasks, task); err != nil {
 			slog.Error("failed to publish scraper task", "url", meta.URL, "error", err)
-			// Don't reschedule — it stays at current score and will be retried next tick.
 			continue
 		}
 

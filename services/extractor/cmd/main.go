@@ -7,14 +7,12 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/Gergov00/pricescount/shared/pkg/broker"
+	"github.com/Gergov00/pricescount/shared/pkg/marketplace"
 	"github.com/Gergov00/pricescount/services/extractor/internal/config"
 	"github.com/Gergov00/pricescount/services/extractor/internal/consumer"
 	"github.com/Gergov00/pricescount/services/extractor/internal/dedup"
-	"github.com/Gergov00/pricescount/services/extractor/internal/headless"
-	"github.com/Gergov00/pricescount/services/extractor/internal/llm"
 	"github.com/Gergov00/pricescount/services/extractor/internal/publisher"
-	"github.com/Gergov00/pricescount/services/extractor/internal/scraper"
-	"github.com/Gergov00/pricescount/shared/pkg/broker"
 )
 
 func main() {
@@ -43,19 +41,14 @@ func main() {
 	}
 	defer dd.Close()
 
-	hs, err := headless.New()
-	if err != nil {
-		slog.Error("headless browser init failed", "error", err)
-		os.Exit(1)
-	}
-	defer hs.Close()
+	wbClient := marketplace.NewWBClient()
+	defer wbClient.Close()
 
 	c := consumer.New(
 		conn,
 		dd,
-		scraper.New(),
-		hs,
-		llm.New(cfg.LLMAPIKey, cfg.LLMModel),
+		wbClient,
+		marketplace.NewOzonClient(),
 		publisher.New(conn),
 	)
 
@@ -67,7 +60,7 @@ func main() {
 		}
 	}()
 
-	slog.Info("extractor service started", "model", cfg.LLMModel)
+	slog.Info("extractor service started")
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)

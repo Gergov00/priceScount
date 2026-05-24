@@ -32,7 +32,7 @@ func (b *Bot) handleMyList(ctx context.Context, chatID int64) {
 		return
 	}
 	if len(subs) == 0 {
-		b.send(chatID, "У тебя пока нет отслеживаемых товаров.\n\nНапиши название товара чтобы начать.")
+		b.send(chatID, "У тебя пока нет отслеживаемых товаров.\n\nПришли ссылку на товар с Wildberries или Ozon чтобы начать.")
 		return
 	}
 
@@ -51,7 +51,7 @@ func (b *Bot) refreshMyList(ctx context.Context, chatID int64, messageID int) {
 		return
 	}
 	if len(subs) == 0 {
-		edit := tgbotapi.NewEditMessageText(chatID, messageID, "У тебя больше нет отслеживаемых товаров.\n\nНапиши название товара чтобы начать.")
+		edit := tgbotapi.NewEditMessageText(chatID, messageID, "У тебя больше нет отслеживаемых товаров.\n\nПришли ссылку на товар чтобы начать.")
 		b.api.Send(edit)
 		return
 	}
@@ -227,23 +227,46 @@ func (b *Bot) handleForceCheck(ctx context.Context, chatID int64, subID string) 
 		return
 	}
 
-	urls := b.productURLs(ctx, productID)
-	if len(urls) == 0 {
+	type urlEntry struct {
+		url      string
+		platform string
+	}
+	dbRows, err := b.db.Query(ctx,
+		`SELECT url, source FROM tracked_urls WHERE product_id = $1 AND active = true ORDER BY created_at`,
+		productID,
+	)
+	if err != nil {
+		slog.Error("force check: query urls failed", "error", err)
+		b.send(chatID, "Ошибка при запросе ссылок.")
+		return
+	}
+	defer dbRows.Close()
+	var entries []urlEntry
+	for dbRows.Next() {
+		var e urlEntry
+		if err := dbRows.Scan(&e.url, &e.platform); err != nil {
+			continue
+		}
+		entries = append(entries, e)
+	}
+
+	if len(entries) == 0 {
 		b.send(chatID, "Нет отслеживаемых ссылок для этого товара.")
 		return
 	}
 
 	published := 0
-	for _, u := range urls {
+	for _, e := range entries {
 		task := contracts.ScraperTask{
 			TaskID:      uuid.New().String(),
 			ProductID:   productID,
-			URL:         u,
+			URL:         e.url,
+			Platform:    e.platform,
 			ScheduledAt: time.Now().UTC(),
 			Force:       true,
 		}
 		if err := b.broker.Publish(ctx, broker.QueueScraperTasks, task); err != nil {
-			slog.Error("force check publish failed", "url", u, "error", err)
+			slog.Error("force check publish failed", "url", e.url, "error", err)
 			continue
 		}
 		published++
@@ -251,7 +274,7 @@ func (b *Bot) handleForceCheck(ctx context.Context, chatID int64, subID string) 
 
 	b.send(chatID, fmt.Sprintf(
 		"🔄 Проверка запущена для %q\n\nОтправлено задач: %d из %d.\nРезультат придёт в течение минуты.",
-		productName, published, len(urls),
+		productName, published, len(entries),
 	))
 }
 
