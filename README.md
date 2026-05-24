@@ -1,31 +1,25 @@
 # priceScount
 
-Система мониторинга цен на основе микросервисов. Пользователь вводит название товара в Telegram-бот, система находит магазины, периодически проверяет цену и присылает уведомление когда цена выходит за установленный диапазон.
+Система мониторинга цен на основе микросервисов. Пользователь отправляет ссылку на товар с Wildberries в Telegram-бот, система периодически проверяет цену и присылает уведомление когда цена выходит за установленный диапазон.
 
 ## Как это работает
 
 ```
 Пользователь (Telegram-бот)
-        │
+        │  отправляет ссылку WB
         ▼
- [Discovery Service]  — ищет товар через Google Shopping (Serper API)
+   [Bot Service]       — валидирует URL, получает цену и название,
+        │                сохраняет подписку в PostgreSQL
         │  discovery.urls
         ▼
- [Scheduler Service]  — хранит URL в Redis, раз в час запускает проверку
+ [Scheduler Service]   — хранит URL в Redis, по расписанию публикует задачи
         │  scraper.tasks
         ▼
- [Extractor Service]  — скрапит страницу, извлекает цену
+ [Extractor Service]   — headless Chromium скрапит страницу, извлекает цену
         │  price.results
         ▼
- [Notifier Service]   — сохраняет цену в PostgreSQL, шлёт алерт в Telegram
+ [Notifier Service]    — сохраняет цену в PostgreSQL, шлёт алерт в Telegram
 ```
-
-**Стратегия извлечения цены (в порядке приоритета):**
-1. JSON-LD (`schema.org/Product`) из обычного HTTP-ответа
-2. `__NEXT_DATA__` — для сайтов на Next.js (Gold Apple и др.)
-3. LLM (Groq, llama-3.3-70b) на сыром HTML
-4. Headless Chrome (Chromium) — для JS-rendered страниц и сайтов, блокирующих обычные запросы
-5. Повтор шагов 1–3 на HTML от headless
 
 ## Стек
 
@@ -34,18 +28,17 @@
 | Язык | Go 1.26 |
 | База данных | PostgreSQL 16 (pgx/v5, без ORM) |
 | Очередь сообщений | RabbitMQ 3.13 |
-| Кэш / дедупликация | Redis 7 |
+| Кэш / дедупликация / сессии | Redis 7 |
 | Бот | go-telegram-bot-api/v5 |
-| Поиск товаров | Serper API (Google Shopping) |
-| LLM | Groq API (llama-3.3-70b-versatile) |
-| Headless браузер | Chromium + chromedp |
+| Скрапинг | Chromium + chromedp (headless) |
+| Деплой | Docker + Docker Compose |
 
 ## Запуск
 
 ### 1. Зависимости
 
 - Docker и Docker Compose
-- Аккаунты: [Serper](https://serper.dev), [Groq](https://console.groq.com), Telegram Bot Token (`@BotFather`)
+- Telegram Bot Token (получить у `@BotFather`)
 
 ### 2. Переменные окружения
 
@@ -57,8 +50,6 @@ cp .env.example .env
 
 ```env
 TELEGRAM_BOT_TOKEN=...   # от @BotFather
-SERPER_API_KEY=...        # от serper.dev
-GROQ_API_KEY=...          # от console.groq.com
 ```
 
 ### 3. Запуск
@@ -71,7 +62,10 @@ docker compose up --build -d
 
 ### 4. Проверка
 
-Открыть бот в Telegram и написать название товара, например: `iPhone 15 Pro`.
+Открыть бот в Telegram и отправить ссылку на товар, например:
+```
+https://www.wildberries.ru/catalog/303271048/detail.aspx
+```
 
 ### Остановка
 
@@ -84,49 +78,46 @@ docker compose down -v     # остановить и удалить все да�
 
 | Действие | Как |
 |----------|-----|
-| Найти товар | Написать название в чат |
-| Выбрать магазины | Inline-кнопки с названием, ценой и ссылкой |
-| Отмена поиска | Кнопка 🚫 Отмена в списке магазинов |
+| Начать отслеживание | Отправить ссылку на товар WB |
 | Мои товары | Кнопка «📋 Мои товары» или `/mylist` |
 | Поставить на паузу | Кнопка ⏸ в списке товаров |
 | Возобновить | Кнопка ▶ в списке товаров |
 | Изменить диапазон цен | Кнопка ✏️ в списке товаров |
 | История цен | Кнопка 📊 История |
-| Принудительная проверка | Кнопка 🔄 Проверить |
-| Удалить товар | Кнопка 🗑 Удалить (снизу каждого товара) |
+| Принудительная проверка | Кнопка 🔄 Проверить — сразу присылает текущую цену |
+| Удалить товар | Кнопка 🗑 Удалить |
 
 ## Структура проекта
 
 ```
 services/
   bot/          — Telegram-бот (пользовательский интерфейс)
-  discovery/    — HTTP API, поиск товаров через Serper
   scheduler/    — тик-луп, планирование проверок через Redis
-  extractor/    — скрапинг цен (HTTP + headless + LLM)
+  extractor/    — скрапинг цен через headless Chromium
   notifier/     — сохранение цен, отправка алертов
 shared/
-  pkg/broker/      — обёртка над RabbitMQ (amqp091-go)
-  pkg/contracts/   — типы сообщений для всех очередей
+  pkg/broker/       — обёртка над RabbitMQ (amqp091-go)
+  pkg/contracts/    — типы сообщений для всех очередей
+  pkg/marketplace/  — клиенты WB и Ozon
 migrations/
   init.sql      — схема БД (применяется при первом запуске)
 ```
 
-## Известные проблемы
+## Конфигурация
 
-### Магазины, которые не парсятся
+| Переменная | Сервис | По умолчанию | Описание |
+|------------|--------|-------------|----------|
+| `TELEGRAM_BOT_TOKEN` | bot, notifier | — | Обязательно |
+| `POSTGRES_DSN` | bot, notifier | localhost | Строка подключения к PostgreSQL |
+| `RABBITMQ_URL` | все | guest/guest@localhost | URL брокера |
+| `REDIS_URL` | bot, scheduler, extractor | localhost:6379 | URL Redis |
+| `CHECK_INTERVAL_MINUTES` | scheduler, extractor | 60 | Интервал проверки цен и TTL дедупликации |
 
-| Магазин | Проблема | Статус |
-|---------|----------|--------|
-| **Ozon** | TLS fingerprint блокировка — соединение обрывается до получения ответа | Частично: headless Chrome использует реальный browser fingerprint, но Ozon может блокировать и его |
-| **Amazon** | Возвращает 200 OK с CAPTCHA-страницей вместо товара | Не решено: статус 200 не триггерит headless fallback |
-| **Wildberries** | Цена рендерится через JS после загрузки страницы | Частично: headless ждёт 3 сек после появления `body`, но цена может не успеть отрендериться |
-| **Gold Apple** | Next.js SSR: цена лежит в `__NEXT_DATA__` JSON | Добавлен парсер `__NEXT_DATA__`, требует тестирования |
+## Известные ограничения
 
-### Другие известные проблемы
-
-- **Каталожные URL в поиске** — если запрос слишком общий (например, «кроссовки Nike»), discovery возвращает ссылки на каталоги, а не конкретные товары. Обходной путь: вводить точную модель.
-- **Схема БД не мигрирует автоматически** — `init.sql` применяется только при первом создании контейнера PostgreSQL. При изменении схемы нужно пересоздать том: `docker compose down -v && docker compose up -d`.
-- **Amazon CAPTCHA не детектируется** — сайт возвращает 200 OK, поэтому headless fallback не активируется. Нужна отдельная проверка содержимого ответа.
+- **Ozon временно отключён** — Cloudflare блокирует все запросы (HTTP и headless). Будет включён после добавления обхода TLS fingerprinting.
+- **Схема БД не мигрирует автоматически** — `init.sql` применяется только при первом создании тома PostgreSQL. При изменении схемы: `docker compose down -v && docker compose up -d`.
+- **WB headless медленный** — каждый скрейп занимает ~30–40 секунд из-за запуска Chromium и ожидания рендера страницы.
 
 ## Локальная разработка
 
@@ -139,7 +130,6 @@ cd services/bot && go run ./cmd/
 
 # собрать все сервисы
 go build github.com/Gergov00/pricescount/services/bot/... \
-         github.com/Gergov00/pricescount/services/discovery/... \
          github.com/Gergov00/pricescount/services/scheduler/... \
          github.com/Gergov00/pricescount/services/extractor/... \
          github.com/Gergov00/pricescount/services/notifier/...
