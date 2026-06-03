@@ -1,37 +1,50 @@
 # priceScount
 
-Система мониторинга цен на основе микросервисов. Пользователь отправляет ссылку на товар с Wildberries в Telegram-бот, система периодически проверяет цену и присылает уведомление когда цена выходит за установленный диапазон.
+Система мониторинга цен на Wildberries. Пользователь отправляет ссылку на товар в Telegram-бот, задаёт диапазон цен — система периодически проверяет цену и присылает уведомление когда цена выходит за границы.
 
 ## Как это работает
 
 ```
-Пользователь (Telegram-бот)
-        │  отправляет ссылку WB
-        ▼
-   [Bot Service]       — валидирует URL, получает цену и название,
-        │                сохраняет подписку в PostgreSQL
-        │  discovery.urls
-        ▼
- [Scheduler Service]   — хранит URL в Redis, по расписанию публикует задачи
-        │  scraper.tasks
-        ▼
- [Extractor Service]   — headless Chromium скрапит страницу, извлекает цену
-        │  price.results
-        ▼
- [Notifier Service]    — сохраняет цену в PostgreSQL, шлёт алерт в Telegram
+[Telegram User]
+      │ long-poll
+      ▼
+   [Bot]  ──REST──▶  [Gateway]  ──lookup.tasks──▶  [Extractor]
+                         │                               │
+                         │◀──────── price.results ───────┘
+                         │
+                         ├──track.requests──▶  [Scheduler]
+                         │                          │
+                         │                    scraper.tasks
+                         │                          │
+                         │◀──────── price.results ──┘
+                         │
+                         └──notify.tasks──▶  [Notifier] ──▶ Telegram
 ```
+
+**Bot** — тонкий клиент, только REST к Gateway. Никакой БД, никаких очередей.
+
+**Gateway** — stateless HTTP-сервер. Хранит пользователей, продукты, подписки, историю цен. Принимает решения по алертам.
+
+**Scheduler** — управляет расписанием проверок в своей PostgreSQL. Публикует задачи скрапинга по тику.
+
+**Extractor** — единственный сервис с Chromium. Два consumer goroutine с разным prefetch.
+
+**Notifier** — тупая доставка: consume notify.tasks → Telegram Bot API.
 
 ## Стек
 
 | Компонент | Технология |
 |-----------|-----------|
-| Язык | Go 1.26 |
+| Язык | Go 1.22+ |
 | База данных | PostgreSQL 16 (pgx/v5, без ORM) |
-| Очередь сообщений | RabbitMQ 3.13 |
-| Кэш / дедупликация / сессии | Redis 7 |
+| Очередь | RabbitMQ 3.13 (amqp091-go) |
 | Бот | go-telegram-bot-api/v5 |
+| HTTP | Gin |
+| DI | uber/fx |
 | Скрапинг | Chromium + chromedp (headless) |
 | Деплой | Docker + Docker Compose |
+
+Redis не используется.
 
 ## Запуск
 
@@ -46,11 +59,7 @@
 cp .env.example .env
 ```
 
-Заполнить в `.env`:
-
-```env
-TELEGRAM_BOT_TOKEN=...   # от @BotFather
-```
+Заполнить `TELEGRAM_BOT_TOKEN` в `.env`.
 
 ### 3. Запуск
 
@@ -58,82 +67,93 @@ TELEGRAM_BOT_TOKEN=...   # от @BotFather
 docker compose up --build -d
 ```
 
-Сервисы поднимаются в правильном порядке автоматически. RabbitMQ management UI: http://localhost:15672 (guest/guest).
-
-### 4. Проверка
-
-Открыть бот в Telegram и отправить ссылку на товар, например:
-```
-https://www.wildberries.ru/catalog/303271048/detail.aspx
-```
+Сервисы поднимаются в правильном порядке. RabbitMQ UI: http://localhost:15672 (guest/guest).
 
 ### Остановка
 
 ```bash
-docker compose down        # остановить, данные сохраняются
-docker compose down -v     # остановить и удалить все данные (PostgreSQL, Redis)
+docker compose down        # данные сохраняются
+docker compose down -v     # удалить все данные (PostgreSQL тома)
 ```
 
 ## Функции бота
 
 | Действие | Как |
 |----------|-----|
-| Начать отслеживание | Отправить ссылку на товар WB |
-| Мои товары | Кнопка «📋 Мои товары» или `/mylist` |
-| Поставить на паузу | Кнопка ⏸ в списке товаров |
-| Возобновить | Кнопка ▶ в списке товаров |
-| Изменить диапазон цен | Кнопка ✏️ в списке товаров |
-| История цен | Кнопка 📊 История |
-| Принудительная проверка | Кнопка 🔄 Проверить — сразу присылает текущую цену |
-| Удалить товар | Кнопка 🗑 Удалить |
+| Начать отслеживание | Отправить ссылку WB |
+| Мои товары | «📋 Мои товары» или `/mylist` |
+| Поставить на паузу | ⏸ в списке |
+| Возобновить | ▶ в списке |
+| Изменить диапазон цен | ✏️ в списке |
+| История цен | 📊 История |
+| Принудительная проверка | 🔄 Проверить — сразу присылает текущую цену |
+| Удалить | 🗑 Удалить |
 
 ## Структура проекта
 
 ```
 services/
-  bot/          — Telegram-бот (пользовательский интерфейс)
-  scheduler/    — тик-луп, планирование проверок через Redis
-  extractor/    — скрапинг цен через headless Chromium
-  notifier/     — сохранение цен, отправка алертов
+  bot/          — Telegram-бот, HTTP-клиент к Gateway
+  gateway/      — HTTP API, PostgreSQL, оркестрация очередей
+  scheduler/    — расписание проверок, PostgreSQL scheduled_urls
+  extractor/    — скрапинг через headless Chromium
+  notifier/     — доставка уведомлений в Telegram
 shared/
-  pkg/broker/       — обёртка над RabbitMQ (amqp091-go)
+  pkg/broker/       — обёртка над RabbitMQ
   pkg/contracts/    — типы сообщений для всех очередей
-  pkg/marketplace/  — клиенты WB и Ozon
+  pkg/marketplace/  — WBClient (chromedp)
+  pkg/platform/     — DetectPlatform, NormalizeWB
 migrations/
-  init.sql      — схема БД (применяется при первом запуске)
+  init.sql          — схема Gateway PostgreSQL
+  scheduler.sql     — схема Scheduler PostgreSQL
 ```
 
 ## Конфигурация
 
-| Переменная | Сервис | По умолчанию | Описание |
-|------------|--------|-------------|----------|
-| `TELEGRAM_BOT_TOKEN` | bot, notifier | — | Обязательно |
-| `POSTGRES_DSN` | bot, notifier | localhost | Строка подключения к PostgreSQL |
-| `RABBITMQ_URL` | все | guest/guest@localhost | URL брокера |
-| `REDIS_URL` | bot, scheduler, extractor | localhost:6379 | URL Redis |
-| `CHECK_INTERVAL_MINUTES` | scheduler, extractor | 60 | Интервал проверки цен и TTL дедупликации |
+| Переменная | Сервис | Описание |
+|------------|--------|----------|
+| `TELEGRAM_BOT_TOKEN` | bot, notifier | Обязательно |
+| `GATEWAY_URL` | bot | URL Gateway, например `http://gateway:8080` |
+| `POSTGRES_DSN` | gateway, scheduler | Строка подключения PostgreSQL |
+| `RABBITMQ_URL` | gateway, scheduler, extractor, notifier | URL брокера |
+| `GATEWAY_ADDR` | gateway | Адрес HTTP-сервера, по умолчанию `:8080` |
+| `CHECK_INTERVAL_MINUTES` | scheduler | Интервал тика проверок, по умолчанию `60` |
 
-## Известные ограничения
+## RabbitMQ очереди
 
-- **Ozon временно отключён** — Cloudflare блокирует все запросы (HTTP и headless). Будет включён после добавления обхода TLS fingerprinting.
-- **Схема БД не мигрирует автоматически** — `init.sql` применяется только при первом создании тома PostgreSQL. При изменении схемы: `docker compose down -v && docker compose up -d`.
-- **WB headless медленный** — каждый скрейп занимает ~30–40 секунд из-за запуска Chromium и ожидания рендера страницы.
+| Очередь | Откуда | Куда | Заметки |
+|---------|--------|------|---------|
+| `lookup.tasks` | Gateway | Extractor | prefetch=1, только первичный lookup |
+| `scraper.tasks` | Scheduler | Extractor | prefetch=2, периодика + force check |
+| `price.results` | Extractor | Gateway | lookup_id или product_id |
+| `track.requests` | Gateway | Scheduler | add / pause / resume / delete / force |
+| `notify.tasks` | Gateway | Notifier | channel: telegram |
 
 ## Локальная разработка
 
 ```bash
-# запустить только инфраструктуру
-docker compose up -d rabbitmq redis postgres
+# только инфраструктура
+docker compose up -d rabbitmq postgres
 
-# запустить один сервис локально
-cd services/bot && go run ./cmd/
+# запустить сервис локально
+cd services/gateway && go run ./cmd/gateway/
 
-# собрать все сервисы
+# собрать все сервисы (от корня workspace)
 go build github.com/Gergov00/pricescount/services/bot/... \
+         github.com/Gergov00/pricescount/services/gateway/... \
          github.com/Gergov00/pricescount/services/scheduler/... \
          github.com/Gergov00/pricescount/services/extractor/... \
          github.com/Gergov00/pricescount/services/notifier/...
 
+# тесты
+go test -race ./...
+
 # линтер
 golangci-lint run
 ```
+
+## Известные ограничения
+
+- **Только Wildberries** — Ozon не поддерживается (Cloudflare блокирует headless).
+- **Схема БД не мигрирует автоматически** — `init.sql` применяется только при первом создании тома. При изменении схемы: `docker compose down -v && docker compose up -d`.
+- **Скрапинг медленный** — каждый fetch занимает ~30–40 секунд из-за запуска Chromium и ожидания рендера.

@@ -113,12 +113,53 @@ func NewServer(addr string, opts ...ServerOption) *Server {
 }
 ```
 
-## Управление зависимостями (для расширяемости)
+## Чистая архитектура
 
-- **Dependency Injection через конструкторы**, а не через глобальные переменные или `init()`.
+**Каждый пакет зависит только от интерфейсов, которые он сам определяет. Никогда не принимать конкретные типы из инфраструктурных пакетов (`*store.Store`, `*broker.Connection`) в сигнатурах конструкторов или функций.**
+
+Правило «интерфейс определяет потребитель» — это не рекомендация, это жёсткое требование:
+
+```go
+// Плохо — handler зависит от конкретной инфраструктуры
+func New(st *store.Store, mq *broker.Connection) *Handler
+
+// Хорошо — handler зависит от интерфейсов, которые он сам объявил
+type Store interface { GetLookup(...) ... }
+type Publisher interface { Publish(...) error }
+func New(st Store, mq Publisher) *Handler
+```
+
+Пакет `store` или `broker` не знают об этих интерфейсах — они просто удовлетворяют им неявно. Проверить соответствие можно через `var _ handler.Store = (*store.Store)(nil)` в тестах.
+
+## Управление зависимостями
+
+- **Dependency Injection через `uber/fx`** — wiring всех зависимостей в `cmd/<service>/main.go` делается через `fx.New()`. Никакого ручного `New(New(New(...)))`.
 - **Зависимости — это интерфейсы, объявленные в потребляющем пакете**, а не конкретные типы из других пакетов.
-- **Никаких глобальных singleton-ов** (logger, db, config) внутри бизнес-кода. Прокидывай явно. Это критично для тестов и расширяемости.
-- **Логгер — тоже зависимость.** Используй `log/slog` (стандарт с Go 1.21+), передавай его как поле структуры.
+- **Никаких глобальных singleton-ов** (logger, db, config) внутри бизнес-кода. Прокидывай явно через fx.
+- **Логгер — тоже зависимость.** Используй `log/slog`, регистрируй через `fx.Provide`.
+
+Структура wiring с fx:
+
+```go
+// cmd/gateway/main.go
+func main() {
+    fx.New(
+        fx.Provide(
+            config.Load,
+            store.New,
+            broker.ConnectWithRetry,
+            handler.New,
+            consumer.New,
+        ),
+        fx.Invoke(startHTTP, startConsumer),
+    ).Run()
+}
+```
+
+- `fx.Provide` — регистрация конструкторов; fx разрешает граф зависимостей автоматически.
+- `fx.Invoke` — запуск lifecycle-хуков (HTTP-сервер, consumer goroutine).
+- `fx.Module` — группировка по домену, если сервис большой.
+- Конструктор всегда возвращает конкретный тип (`*Handler`), а не интерфейс — fx сам подберёт его к нужному интерфейсу в потребителе.
 
 ```go
 // internal/order/service.go
@@ -298,9 +339,9 @@ Redis не используется. Всё хранится в PostgreSQL.
 ### RabbitMQ Queues
 
 ```
-lookup.tasks    — разовые fetch-запросы от Gateway (lookup + force check)
+lookup.tasks    — разовые fetch-запросы от Gateway (только первичный lookup)
                   prefetch=1 в Extractor
-scraper.tasks   — периодические задачи от Scheduler
+scraper.tasks   — периодические задачи от Scheduler (включая force check)
                   prefetch=2 в Extractor
 price.results   — результаты от Extractor к Gateway
 track.requests  — команды изменения подписок от Gateway к Scheduler
@@ -363,7 +404,7 @@ Telegram bot, только HTTP-клиент к Gateway. Никакого пря
 
 - In-memory сессии: `map[int64]*Session{Step, LookupID, MinPrice}`
 - Шаги: `StepIdle → StepWaitingLookup → StepWaitingMinPrice → StepWaitingMaxPrice`
-- Polling lookup: `GET /lookup/:id` каждые 2с, до 60с
+- Polling lookup: `GET /lookup/:id` каждые 2с, до 90с (горутина в bot, таймаут контекста)
 - Команды: `/start`, `/cancel`, `/mylist`
 - Действия: pause · resume · delete · force check · history · edit thresholds
 
@@ -386,6 +427,7 @@ Stateless HTTP-сервер + два фоновых goroutine. Никакого 
 **Background goroutines:**
 - `price.results` consumer: если `lookup_id != ""` → UPDATE lookup_requests(done); иначе → INSERT price_history + проверка порогов + publish notify.tasks
 - TTL cleaner: DELETE lookup_requests WHERE expires_at < NOW() каждые 5 минут
+- Startup resync: при старте публикует `track.requests{add}` для всех активных продуктов → Scheduler восстанавливает scheduled_urls после чистого деплоя
 
 Config: `POSTGRES_DSN`, `RABBITMQ_URL`, `GATEWAY_ADDR`
 
@@ -398,7 +440,7 @@ Config: `POSTGRES_DSN`, `RABBITMQ_URL`, `GATEWAY_ADDR`
   - `pause` → UPDATE active=false
   - `resume` → UPDATE next_check_at=NOW()
   - `delete` → DELETE
-  - `force` → UPDATE next_check_at=NOW()
+  - `force` → publish scraper.tasks{Force:true} немедленно + AdvanceNextCheck (чтобы тик не дублировал)
 - Tick loop каждые N минут: `SELECT WHERE next_check_at ≤ NOW() AND active FOR UPDATE SKIP LOCKED` → publish scraper.tasks → UPDATE next_check_at += interval
 
 Config: `POSTGRES_DSN`, `RABBITMQ_URL`, `CHECK_INTERVAL_MINUTES`

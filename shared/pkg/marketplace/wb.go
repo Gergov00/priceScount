@@ -40,14 +40,6 @@ func (c *WBClient) Close() {
 	c.allocCancel()
 }
 
-func NormalizeWBURL(rawURL string) (string, error) {
-	m := wbProductIDRe.FindStringSubmatch(rawURL)
-	if m == nil {
-		return "", fmt.Errorf("no wildberries product id in url")
-	}
-	return "https://www.wildberries.ru/catalog/" + m[1] + "/detail.aspx", nil
-}
-
 func (c *WBClient) FetchProduct(ctx context.Context, rawURL string) (*Product, error) {
 	m := wbProductIDRe.FindStringSubmatch(rawURL)
 	if m == nil {
