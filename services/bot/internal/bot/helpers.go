@@ -16,6 +16,3 @@ func parsePrice(text string) (float64, error) {
 	return price, nil
 }
 
-func parseIndex(data, prefix string) (int, error) {
-	return strconv.Atoi(strings.TrimPrefix(data, prefix))
-}

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
 	"github.com/Gergov00/pricescount/shared/pkg/broker"
 	"github.com/Gergov00/pricescount/shared/pkg/contracts"
 	"github.com/Gergov00/pricescount/services/scheduler/internal/store"
@@ -14,15 +15,15 @@ import (
 // Scheduler periodically picks URLs due for re-checking and publishes scraper tasks.
 type Scheduler struct {
 	conn     *broker.Connection
-	store    *store.URLStore
+	store    *store.Store
 	interval time.Duration
 }
 
-func New(conn *broker.Connection, st *store.URLStore, interval time.Duration) *Scheduler {
+func New(conn *broker.Connection, st *store.Store, interval time.Duration) *Scheduler {
 	return &Scheduler{conn: conn, store: st, interval: interval}
 }
 
-// Run starts the tick loop. It dispatches immediately on start, then every interval.
+// Run starts the tick loop. Dispatches immediately on start, then every interval.
 func (s *Scheduler) Run(ctx context.Context) error {
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
@@ -41,35 +42,30 @@ func (s *Scheduler) Run(ctx context.Context) error {
 }
 
 func (s *Scheduler) dispatch(ctx context.Context) {
-	due, err := s.store.DueURLs(ctx)
+	due, err := s.store.DueURLs(ctx, s.interval)
 	if err != nil {
-		slog.Error("failed to fetch due URLs from Redis", "error", err)
+		slog.Error("failed to fetch due URLs", "error", err)
 		return
 	}
 	if len(due) == 0 {
-		slog.Info("scheduler tick: no URLs due")
+		slog.Debug("scheduler tick: no URLs due")
 		return
 	}
 
-	slog.Info("scheduler tick: dispatching tasks", "count", len(due))
+	slog.Info("scheduler tick: dispatching", "count", len(due))
 	dispatched := 0
 
-	for _, meta := range due {
+	for _, entry := range due {
 		task := contracts.ScraperTask{
 			TaskID:      uuid.New().String(),
-			ProductID:   meta.ProductID,
-			URL:         meta.URL,
-			Platform:    meta.Platform,
+			ProductID:   entry.ProductID,
+			URL:         entry.URL,
+			Platform:    entry.Platform,
 			ScheduledAt: time.Now().UTC(),
 		}
-
 		if err := s.conn.Publish(ctx, broker.QueueScraperTasks, task); err != nil {
-			slog.Error("failed to publish scraper task", "url", meta.URL, "error", err)
+			slog.Error("publish scraper task failed", "url", entry.URL, "error", err)
 			continue
-		}
-
-		if err := s.store.Reschedule(ctx, meta.URL, s.interval); err != nil {
-			slog.Error("failed to reschedule URL", "url", meta.URL, "error", err)
 		}
 		dispatched++
 	}

@@ -1,5 +1,3 @@
-# CLAUDE.md
-
 # CLAUDE.md — Go Development Guidelines
 
 Этот документ задаёт правила написания Go-кода. Следуй им строго. При конфликте с привычками — побеждают эти правила.
@@ -249,155 +247,281 @@ func TestParse(t *testing.T) {
 7. Логирование — структурированное и не избыточное.
 8. Изменения не нарушают обратную совместимость публичного API (или есть основание).
 
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+---
 
 ## Project
 
-**priceScount** — a microservices-based price monitoring system. Users send a Wildberries or Ozon product URL to the Telegram bot; the system periodically fetches the price via platform APIs, stores history in PostgreSQL, and sends alerts when the price crosses user-defined thresholds.
+**priceScount** — система мониторинга цен на Wildberries. Пользователь отправляет ссылку на товар Telegram-боту; система периодически парсит цену через headless Chrome, хранит историю в PostgreSQL и шлёт алерт когда цена выходит за заданный диапазон.
 
 ## Tech Stack
 
 - **Language**: Go 1.22+
-- **Database**: PostgreSQL (`pgx/v5`, raw SQL — no ORM)
+- **Database**: PostgreSQL (`pgx/v5`, raw SQL — без ORM)
 - **Messaging**: RabbitMQ (`amqp091-go`)
-- **Key-Value**: Redis (sorted sets for scheduling, dedup TTL, user session state)
 - **Telegram**: `go-telegram-bot-api/v5`
+- **Scraping**: chromedp + headless Chromium (только в Extractor)
 - **Deployment**: Docker & Docker Compose
+
+Redis не используется. Всё хранится в PostgreSQL.
 
 ## Architecture
 
-Four Go services communicate over RabbitMQ. Redis handles URL scheduling, deduplication, and bot session state. PostgreSQL stores price history and subscriptions.
+Пять Go-сервисов. Bot — тонкий HTTP-клиент к Gateway. Gateway — stateless HTTP-сервер. Chromedp строго только в Extractor.
 
 ```
 [Telegram User]
-      │ (sends WB or Ozon product URL)
-      ▼
-[Bot Service]
-  - validates URL (wildberries.ru / ozon.ru only)
-  - fetches product name + price via marketplace API
-  - saves subscription to PostgreSQL
-  - publishes to discovery.urls
       │
       ▼
-[Scheduler Service] ──scraper.tasks (hourly tick)──▶ [Extractor Service]
-                                                             │
-                                               WB: card.wb.ru JSON API
-                                               Ozon: HTTP + JSON parsing
-                                                             │
-                                                       price.results
-                                                             ▼
-                                                    [Notifier Service]
-                                                   PostgreSQL + Telegram alert
+[Bot]  ──REST──▶  [Gateway]  ──lookup.tasks──▶  [Extractor]
+                     │                                │
+                     │◀────── price.results ──────────┘
+                     │
+                     ├──track.requests──▶  [Scheduler]
+                     │                         │
+                     │                    scraper.tasks
+                     │                         │
+                     │◀────── price.results ──[Extractor]
+                     │
+                     └──notify.tasks──▶  [Notifier] ──▶ Telegram
 ```
 
 ### Services
 
-| Service | Consumes | Produces | Status |
-|---------|----------|----------|--------|
-| `services/scheduler` | `discovery.urls` | `scraper.tasks` | ✅ done |
-| `services/extractor` | `scraper.tasks` | `price.results` | ✅ done |
-| `services/notifier`  | `price.results` | — | ✅ done |
-| `services/bot`       | — (polls Telegram) | `discovery.urls` | ✅ done |
+| Сервис | Потребляет | Публикует |
+|--------|-----------|----------|
+| `services/bot` | — (Telegram long-poll) | REST → Gateway |
+| `services/gateway` | `price.results` | `lookup.tasks`, `track.requests`, `notify.tasks` |
+| `services/scheduler` | `track.requests` | `scraper.tasks` |
+| `services/extractor` | `lookup.tasks`, `scraper.tasks` | `price.results` |
+| `services/notifier` | `notify.tasks` | — |
 
-### Shared module (`shared/`)
+### RabbitMQ Queues
 
-Used by all services. Module path: `github.com/Gergov00/pricescount/shared`.
+```
+lookup.tasks    — разовые fetch-запросы от Gateway (lookup + force check)
+                  prefetch=1 в Extractor
+scraper.tasks   — периодические задачи от Scheduler
+                  prefetch=2 в Extractor
+price.results   — результаты от Extractor к Gateway
+track.requests  — команды изменения подписок от Gateway к Scheduler
+                  action: add | pause | resume | delete | force
+notify.tasks    — готовые сообщения от Gateway к Notifier
+                  channel: telegram | email | push
+```
 
-- `pkg/broker` — `Connection` wraps amqp091-go: `ConnectWithRetry`, `DeclareQueue`, `Publish`, `Consume`. QoS prefetch = 10; all consumers ack/nack manually. Queue name constants: `QueueDiscoveryURLs`, `QueueScraperTasks`, `QueuePriceResults`.
-- `pkg/contracts` — typed message structs for all queues. Always use these, never raw maps.
-- `pkg/marketplace` — `WBClient`, `OzonClient`, `DetectPlatform(url)`, `NormalizeWBURL`, `NormalizeOzonURL`.
+### Queue Contracts (`shared/pkg/contracts`)
 
 ```go
-type DiscoveredURL struct { ProductID, ProductName, URL, Platform, Source string; DiscoveredAt time.Time }
-type ScraperTask   struct { TaskID, ProductID, URL, Platform string; ScheduledAt time.Time; Force bool }
-type PriceResult   struct { TaskID, ProductID, URL, Currency string; Price float64; ScrapedAt time.Time; Success bool; Error string }
+type LookupTask struct {
+    TaskID   string    `json:"task_id"`
+    LookupID string    `json:"lookup_id"`
+    URL      string    `json:"url"`
+    Platform string    `json:"platform"`
+}
+
+type ScraperTask struct {
+    TaskID      string    `json:"task_id"`
+    ProductID   string    `json:"product_id"`
+    URL         string    `json:"url"`
+    Platform    string    `json:"platform"`
+    ScheduledAt time.Time `json:"scheduled_at"`
+    Force       bool      `json:"force,omitempty"`
+}
+
+type PriceResult struct {
+    TaskID    string    `json:"task_id"`
+    LookupID  string    `json:"lookup_id,omitempty"`  // если это lookup, не мониторинг
+    ProductID string    `json:"product_id,omitempty"` // если это мониторинг
+    URL       string    `json:"url"`
+    Price     float64   `json:"price"`
+    Currency  string    `json:"currency"`
+    Name      string    `json:"name,omitempty"`       // только для lookup
+    ScrapedAt time.Time `json:"scraped_at"`
+    Success   bool      `json:"success"`
+    Error     string    `json:"error,omitempty"`
+}
+
+type TrackRequest struct {
+    Action          string `json:"action"` // add | pause | resume | delete | force
+    ProductID       string `json:"product_id"`
+    URL             string `json:"url"`
+    Platform        string `json:"platform"`
+    IntervalHours   int    `json:"interval_hours,omitempty"`
+}
+
+type NotifyTask struct {
+    Channel   string `json:"channel"`  // telegram | email | push
+    Target    string `json:"target"`   // chat_id, email, device token
+    Text      string `json:"text"`
+    Direction string `json:"direction,omitempty"` // up | down
+}
 ```
 
-### Marketplace clients (`shared/pkg/marketplace`)
+### Bot (`services/bot`)
 
-- `WBClient.FetchProduct(url)` — calls `card.wb.ru/cards/v2/detail?nm={id}`. Price in kopecks (÷100 = rubles). No auth needed.
-- `OzonClient.FetchProduct(url)` — calls `ozon.ru/api/composer-api.bx/page/json/v2?url={path}`, parses `widgetStates` for price. May need proxy in production if blocked.
-- `DetectPlatform(url)` — returns `"wb"` or `"ozon"`, error otherwise.
-- `NormalizeWBURL` / `NormalizeOzonURL` — canonical URL form (strips query params etc.).
+Telegram bot, только HTTP-клиент к Gateway. Никакого прямого доступа к БД или очередям.
 
-### Scheduler Service internals
+- In-memory сессии: `map[int64]*Session{Step, LookupID, MinPrice}`
+- Шаги: `StepIdle → StepWaitingLookup → StepWaitingMinPrice → StepWaitingMaxPrice`
+- Polling lookup: `GET /lookup/:id` каждые 2с, до 60с
+- Команды: `/start`, `/cancel`, `/mylist`
+- Действия: pause · resume · delete · force check · history · edit thresholds
 
-- `internal/consumer` — reads `discovery.urls`, stores URL + platform via `ZADD NX`.
-- `internal/store` — sorted set `pricescount:urls` (score = next check unix), hash `pricescount:url_meta` (url → `productID|platform`).
-- `internal/scheduler` — tick loop (`CHECK_INTERVAL_MINUTES`, default 60): due URLs → publish `ScraperTask` with `Platform` → reschedule.
+Config: `TELEGRAM_BOT_TOKEN`, `GATEWAY_URL`
 
-### Extractor Service internals
+### Gateway (`services/gateway`)
 
-- `internal/consumer` — reads `scraper.tasks`; routes by `task.Platform`: `"wb"` → `WBClient`, `"ozon"` → `OzonClient`; checks Redis dedup; publishes `PriceResult`.
-- `internal/dedup` — Redis dedup TTL (default 1 h, `SCRAPED_TTL`).
-- `internal/publisher` — publishes `PriceResult` to RabbitMQ.
+Stateless HTTP-сервер + два фоновых goroutine. Никакого chromedp.
 
-Config: `RABBITMQ_URL`, `REDIS_URL`, `SCRAPED_TTL`.
+**REST API:**
+- `POST /lookup` — INSERT lookup_requests(pending), publish lookup.tasks → 202 {lookup_id}
+- `GET /lookup/:id` — SELECT lookup_requests → 200 done / 202 pending
+- `POST /subscriptions` — INSERT products + subscriptions, publish track.requests{add}
+- `GET /subscriptions?chat_id=` — список подписок пользователя
+- `PATCH /subscriptions/:id` — pause / resume / edit thresholds, publish track.requests
+- `DELETE /subscriptions/:id` — soft delete, publish track.requests{delete}
+- `GET /subscriptions/:id/history` — точки графика цены
+- `POST /subscriptions/:id/check` — publish track.requests{force}
 
-### Notifier Service internals
+**Background goroutines:**
+- `price.results` consumer: если `lookup_id != ""` → UPDATE lookup_requests(done); иначе → INSERT price_history + проверка порогов + publish notify.tasks
+- TTL cleaner: DELETE lookup_requests WHERE expires_at < NOW() каждые 5 минут
 
-- `internal/consumer` — reads `price.results`; saves price to PostgreSQL; queries active non-paused subscriptions; fires alert if price < `min_price` or price > `max_price`.
-- `internal/store` — `SavePrice()` upserts `products` + `tracked_urls`, inserts `price_history`; `TriggeredSubscriptions()` returns matching subscriptions.
-- `internal/alert` — Telegram Bot API HTTP client; sends formatted message (📉 drop / 📈 rise).
+Config: `POSTGRES_DSN`, `RABBITMQ_URL`, `GATEWAY_ADDR`
 
-Config: `RABBITMQ_URL`, `POSTGRES_DSN`, `TELEGRAM_BOT_TOKEN`.
+### Scheduler (`services/scheduler`)
 
-### Bot Service internals
+Потребляет команды, управляет расписанием в PostgreSQL.
 
-Telegram bot UI — no HTTP server, polls Telegram via long-polling.
+- Consume `track.requests`:
+  - `add` → INSERT scheduled_urls
+  - `pause` → UPDATE active=false
+  - `resume` → UPDATE next_check_at=NOW()
+  - `delete` → DELETE
+  - `force` → UPDATE next_check_at=NOW()
+- Tick loop каждые N минут: `SELECT WHERE next_check_at ≤ NOW() AND active FOR UPDATE SKIP LOCKED` → publish scraper.tasks → UPDATE next_check_at += interval
 
-User flow:
-1. User sends a Wildberries or Ozon product URL.
-2. Bot validates URL, fetches product name + current price via marketplace API.
-3. Bot prompts for min/max price thresholds.
-4. Subscription saved to PostgreSQL; URL published to `discovery.urls`.
-5. `/mylist` — shows tracked products with pause/resume/delete/refresh/edit buttons.
+Config: `POSTGRES_DSN`, `RABBITMQ_URL`, `CHECK_INTERVAL_MINUTES`
 
-- `internal/bot/bot.go` — main dispatcher; commands `/start`, `/cancel`, `/mylist`.
-- `internal/bot/search.go` — URL submit handler (`handleURLSubmit`), min/max price collection, subscription save + publish.
-- `internal/bot/mylist.go` — tracked products list, inline keyboard, history, force check.
-- `internal/bot/edit.go` — edit price thresholds handler.
-- `internal/bot/helpers.go` — `parsePrice`, `parseIndex`.
-- `internal/state/state.go` — Redis user session state.
+### Extractor (`services/extractor`)
 
-Config: `TELEGRAM_BOT_TOKEN`, `REDIS_URL`, `POSTGRES_DSN`, `RABBITMQ_URL`.
+Единственный сервис с chromedp. Два consumer goroutine с разным prefetch.
 
-### Database schema (`migrations/init.sql`)
+- Goroutine 1: consume `lookup.tasks` (prefetch=1) → chromedp → publish price.results{lookup_id}
+- Goroutine 2: consume `scraper.tasks` (prefetch=2) → chromedp → publish price.results{product_id}
+- `lookup_id` проходит насквозь без изменений
+- Только Wildberries. Ozon не поддерживается.
+
+Config: `RABBITMQ_URL`
+
+### Notifier (`services/notifier`)
+
+Тупая доставка. Никакой бизнес-логики.
+
+- Consume `notify.tasks`, роутинг по полю `channel`
+- `telegram` → sendMessage в Telegram Bot API
+- `email`, `push` — future
+
+Config: `RABBITMQ_URL`, `TELEGRAM_BOT_TOKEN`
+
+### Database Schema
+
+**Gateway PostgreSQL:**
 
 ```sql
-products      (id UUID PK, name TEXT, created_at)
-tracked_urls  (id, product_id FK, url UNIQUE, source TEXT,   -- source = "wb" or "ozon"
-               last_checked_at, check_interval_hours, active)
-price_history (id, url_id FK, price NUMERIC, currency VARCHAR(3), scraped_at)
-subscriptions (id, product_id FK, chat_id BIGINT, min_price, max_price, currency, active, paused, created_at)
-  UNIQUE(product_id, chat_id)
+users (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    chat_id    BIGINT UNIQUE NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+
+products (
+    id         UUID PRIMARY KEY,
+    name       TEXT NOT NULL,
+    url        TEXT NOT NULL UNIQUE,
+    platform   TEXT NOT NULL,  -- "wb"
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+
+subscriptions (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id    UUID NOT NULL REFERENCES users(id),
+    product_id UUID NOT NULL REFERENCES products(id),
+    min_price  NUMERIC(12,2),
+    max_price  NUMERIC(12,2),
+    paused     BOOLEAN NOT NULL DEFAULT FALSE,
+    active     BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(user_id, product_id)
+)
+
+price_history (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    product_id UUID NOT NULL REFERENCES products(id),
+    price      NUMERIC(12,2) NOT NULL,
+    currency   VARCHAR(3) NOT NULL DEFAULT 'RUB',
+    scraped_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+
+lookup_requests (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    url        TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'pending',  -- pending | done | failed
+    name       TEXT,
+    price      NUMERIC(12,2),
+    error      TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '10 minutes'
+)
 ```
+
+**Scheduler PostgreSQL:**
+
+```sql
+scheduled_urls (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    product_id           UUID NOT NULL,
+    url                  TEXT NOT NULL UNIQUE,
+    platform             TEXT NOT NULL,
+    next_check_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    check_interval_hours INT NOT NULL DEFAULT 1,
+    active               BOOLEAN NOT NULL DEFAULT TRUE
+)
+```
+
+### Shared Module (`shared/`)
+
+Module path: `github.com/Gergov00/pricescount/shared`
+
+- `pkg/broker` — `Connection` wraps amqp091-go: `ConnectWithRetry`, `DeclareQueue`, `Publish`, `Consume`. Все consumer-ы ack/nack вручную. Константы очередей: `QueueLookupTasks`, `QueueScraperTasks`, `QueuePriceResults`, `QueueTrackRequests`, `QueueNotifyTasks`.
+- `pkg/contracts` — типизированные структуры для всех очередей. Всегда использовать их, никогда raw map.
+- `pkg/marketplace` — `WBClient` (chromedp), `DetectPlatform(url)`, `NormalizeWBURL`.
 
 ## Commands
 
 ### Setup
 
 ```bash
-cp .env.example .env    # fill in TELEGRAM_BOT_TOKEN
+cp .env.example .env    # заполнить TELEGRAM_BOT_TOKEN
 ```
 
 ### Run
 
 ```bash
-docker compose up --build       # full stack
-docker compose up --build -d    # detached
+docker compose up --build
+docker compose up --build -d
 ```
 
 ### Build
 
 ```bash
-# all services from workspace root
-go build github.com/Gergov00/pricescount/services/scheduler/... \
+# от корня workspace
+go build github.com/Gergov00/pricescount/services/bot/... \
+         github.com/Gergov00/pricescount/services/gateway/... \
+         github.com/Gergov00/pricescount/services/scheduler/... \
          github.com/Gergov00/pricescount/services/extractor/... \
-         github.com/Gergov00/pricescount/services/notifier/... \
-         github.com/Gergov00/pricescount/services/bot/...
-# note: ./... does not work across workspace module boundaries
+         github.com/Gergov00/pricescount/services/notifier/...
+# ./... не работает через границы модулей workspace
 ```
 
 ### Test & Lint
@@ -409,37 +533,38 @@ golangci-lint run
 
 ## Git Workflow
 
-After the user approves any change, commit immediately with a concise message:
+После того как пользователь одобрил изменение — коммитить немедленно:
 
 ```bash
 git add <changed files>
 git commit -m "feat|fix|refactor: short description"
 ```
 
-- Do not mention Claude in commit messages.
-- One commit per logical change, not per file.
-- Never commit `.env`.
+- Не упоминать Claude в commit messages.
+- Один коммит на логическое изменение, не на файл.
+- Никогда не коммитить `.env`.
 
 ## Coding Rules
 
-- Always check `err` immediately after the call that returns it.
-- Use `log/slog` with `NewJSONHandler` everywhere; never `fmt.Println` for operational output.
-- Load all config from env vars in `internal/config/config.go`.
-- Use `shared/pkg/contracts` for all RabbitMQ message schemas — never define message types inside a service.
-- RabbitMQ consumers: ack on success, nack+requeue on transient errors (Redis down, network), nack+drop on permanent failures (malformed JSON).
-- Redis scheduling: `ZADD NX` to add, `ZRANGEBYSCORE 0 now` to query due items, `ZADD` (without NX) to reschedule.
-- Docker builds use repo root as context; all service Dockerfiles copy all `go.mod` files before `go work sync`.
-- Platform routing in extractor: switch on `task.Platform` (`"wb"` / `"ozon"`); unknown platform → nack+drop.
+- Всегда проверять `err` сразу после вызова который его возвращает.
+- `log/slog` с `NewJSONHandler` везде; никогда `fmt.Println` в продакшен-коде.
+- Конфиг загружать из env vars в `internal/config/config.go`.
+- Использовать `shared/pkg/contracts` для всех RabbitMQ-сообщений — никогда не определять типы сообщений внутри сервиса.
+- RabbitMQ consumer-ы: ack при успехе, nack+requeue при транзиентных ошибках (сеть, БД), nack+drop при постоянных (malformed JSON, unknown platform).
+- Extractor: prefetch=1 для `lookup.tasks`, prefetch=2 для `scraper.tasks`.
+- Scheduler tick: `SELECT FOR UPDATE SKIP LOCKED` — обязательно для корректной работы нескольких реплик.
+- Gateway — stateless. Никакого in-memory состояния кроме map pending lookup channels (только если будет нужно в будущем).
+- Docker builds: repo root как context; все Dockerfile-ы копируют все `go.mod` перед `go work sync`.
 
 ## Go Workspace Notes
 
-Each service `go.mod` has both a `require` and a `replace` directive for `shared`:
+Каждый сервис в `go.mod` имеет `require` и `replace` для `shared`:
 
 ```go
 require github.com/Gergov00/pricescount/shared v0.0.0-00010101000000-000000000000
 replace github.com/Gergov00/pricescount/shared => ../../shared
 ```
 
-`go.work` handles multi-module builds; `replace` prevents Go from trying to resolve the fake version from GitHub. Both are needed. Do not remove `replace` directives.
+`go.work` управляет multi-module сборкой; `replace` нужен чтобы Go не пытался резолвить фейковую версию с GitHub. Оба нужны. Не удалять `replace` директивы.
 
-When adding a new service that depends on `shared`: add both directives, then run `go mod tidy` from the service directory.
+При добавлении нового сервиса зависящего от `shared`: добавить оба directive, затем `go mod tidy` из директории сервиса.

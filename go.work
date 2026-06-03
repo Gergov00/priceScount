@@ -3,6 +3,7 @@ go 1.26
 use (
 	./services/bot
 	./services/extractor
+	./services/gateway
 	./services/notifier
 	./services/scheduler
 	./shared

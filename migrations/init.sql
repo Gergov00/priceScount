@@ -1,46 +1,75 @@
--- Products being tracked
-CREATE TABLE IF NOT EXISTS products (
-    id         UUID PRIMARY KEY,
-    name       TEXT        NOT NULL,
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Gateway PostgreSQL schema
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS users (
+    id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    chat_id    BIGINT      NOT NULL UNIQUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Individual product URLs to monitor
-CREATE TABLE IF NOT EXISTS tracked_urls (
-    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    product_id           UUID        NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-    url                  TEXT        NOT NULL UNIQUE,
-    source               TEXT        NOT NULL,
-    last_checked_at      TIMESTAMPTZ,
-    check_interval_hours INT         NOT NULL DEFAULT 1,
-    active               BOOLEAN     NOT NULL DEFAULT TRUE,
-    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+CREATE TABLE IF NOT EXISTS products (
+    id         UUID        PRIMARY KEY,
+    name       TEXT        NOT NULL,
+    url        TEXT        NOT NULL UNIQUE,
+    platform   TEXT        NOT NULL, -- "wb"
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Price snapshots over time
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id         UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id    UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    product_id UUID         NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    min_price  NUMERIC(12,2),
+    max_price  NUMERIC(12,2),
+    paused     BOOLEAN      NOT NULL DEFAULT FALSE,
+    active     BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    UNIQUE(user_id, product_id)
+);
+
 CREATE TABLE IF NOT EXISTS price_history (
     id         UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
-    url_id     UUID         NOT NULL REFERENCES tracked_urls(id) ON DELETE CASCADE,
+    product_id UUID         NOT NULL REFERENCES products(id) ON DELETE CASCADE,
     price      NUMERIC(12,2) NOT NULL,
-    currency   VARCHAR(3)   NOT NULL DEFAULT 'USD',
+    currency   VARCHAR(3)   NOT NULL DEFAULT 'RUB',
     scraped_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
--- User alert subscriptions (one per product per Telegram chat)
-CREATE TABLE IF NOT EXISTS subscriptions (
-    id         UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
-    product_id UUID         NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-    chat_id    BIGINT       NOT NULL,
-    min_price  NUMERIC(12,2),
-    max_price  NUMERIC(12,2),
-    currency   VARCHAR(3)   NOT NULL DEFAULT 'RUB',
-    active     BOOLEAN      NOT NULL DEFAULT TRUE,
-    paused     BOOLEAN      NOT NULL DEFAULT FALSE,
-    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    UNIQUE(product_id, chat_id)
+-- Temporary table for async one-time product lookups.
+-- Rows expire after 10 minutes and are cleaned up by the Gateway TTL cleaner.
+CREATE TABLE IF NOT EXISTS lookup_requests (
+    id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    url        TEXT        NOT NULL,
+    status     TEXT        NOT NULL DEFAULT 'pending', -- pending | done | failed
+    name       TEXT,
+    price      NUMERIC(12,2),
+    error      TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '10 minutes'
 );
 
-CREATE INDEX IF NOT EXISTS idx_tracked_urls_product_id  ON tracked_urls(product_id);
-CREATE INDEX IF NOT EXISTS idx_price_history_url_id     ON price_history(url_id);
-CREATE INDEX IF NOT EXISTS idx_price_history_scraped_at ON price_history(scraped_at DESC);
-CREATE INDEX IF NOT EXISTS idx_subscriptions_product_id ON subscriptions(product_id);
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Scheduler PostgreSQL schema
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS scheduled_urls (
+    id                   UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    product_id           UUID        NOT NULL,
+    url                  TEXT        NOT NULL UNIQUE,
+    platform             TEXT        NOT NULL, -- "wb"
+    next_check_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    check_interval_hours INT         NOT NULL DEFAULT 1,
+    active               BOOLEAN     NOT NULL DEFAULT TRUE
+);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Indexes
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id      ON subscriptions(user_id);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_product_id   ON subscriptions(product_id);
+CREATE INDEX IF NOT EXISTS idx_price_history_product_id   ON price_history(product_id);
+CREATE INDEX IF NOT EXISTS idx_price_history_scraped_at   ON price_history(scraped_at DESC);
+CREATE INDEX IF NOT EXISTS idx_lookup_requests_expires_at ON lookup_requests(expires_at);
+CREATE INDEX IF NOT EXISTS idx_scheduled_urls_next_check  ON scheduled_urls(next_check_at) WHERE active = TRUE;

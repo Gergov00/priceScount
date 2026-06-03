@@ -1,78 +1,57 @@
 package state
 
-import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"time"
-
-	"github.com/redis/go-redis/v9"
-)
+import "sync"
 
 const (
 	StepIdle            = "idle"
+	StepWaitingLookup   = "waiting_lookup"
 	StepWaitingMinPrice = "waiting_min_price"
 	StepWaitingMaxPrice = "waiting_max_price"
 	StepEditingMinPrice = "editing_min_price"
 	StepEditingMaxPrice = "editing_max_price"
-
-	keyPrefix = "bot:state:"
-	ttl       = 30 * time.Minute
 )
 
+// Session holds the in-progress dialog state for one Telegram chat.
 type Session struct {
-	Step         string  `json:"step"`
-	ProductID    string  `json:"product_id"`
-	ProductName  string  `json:"product_name"`
-	URL          string  `json:"url"`
-	Platform     string  `json:"platform"`      // "wb" or "ozon"
-	CurrentPrice float64 `json:"current_price"` // shown as reference when setting thresholds
-	MinPrice     float64 `json:"min_price"`
+	Step         string
+	LookupID     string  // set during StepWaitingLookup
+	ProductName  string  // filled after lookup completes
+	ProductURL   string
+	CurrentPrice float64
+	MinPrice     float64
 	// edit flow
-	EditingSubID string  `json:"editing_sub_id,omitempty"`
-	OldMinPrice  float64 `json:"old_min_price,omitempty"`
-	OldMaxPrice  float64 `json:"old_max_price,omitempty"`
+	EditingSubID string
+	OldMinPrice  float64
+	OldMaxPrice  float64
 }
 
+// Store is a thread-safe in-memory session store.
 type Store struct {
-	client *redis.Client
+	mu       sync.Mutex
+	sessions map[int64]*Session
 }
 
-func New(redisURL string) (*Store, error) {
-	opts, err := redis.ParseURL(redisURL)
-	if err != nil {
-		return nil, fmt.Errorf("parse redis url: %w", err)
-	}
-	return &Store{client: redis.NewClient(opts)}, nil
+func New() *Store {
+	return &Store{sessions: make(map[int64]*Session)}
 }
 
-func (s *Store) Get(ctx context.Context, chatID int64) (*Session, error) {
-	data, err := s.client.Get(ctx, key(chatID)).Bytes()
-	if err == redis.Nil {
-		return &Session{Step: StepIdle}, nil
+func (s *Store) Get(chatID int64) *Session {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sess, ok := s.sessions[chatID]; ok {
+		return sess
 	}
-	if err != nil {
-		return nil, fmt.Errorf("redis get: %w", err)
-	}
-	var sess Session
-	if err := json.Unmarshal(data, &sess); err != nil {
-		return nil, fmt.Errorf("unmarshal: %w", err)
-	}
-	return &sess, nil
+	return &Session{Step: StepIdle}
 }
 
-func (s *Store) Set(ctx context.Context, chatID int64, sess *Session) error {
-	data, err := json.Marshal(sess)
-	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
-	}
-	return s.client.Set(ctx, key(chatID), data, ttl).Err()
+func (s *Store) Set(chatID int64, sess *Session) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessions[chatID] = sess
 }
 
-func (s *Store) Clear(ctx context.Context, chatID int64) error {
-	return s.client.Del(ctx, key(chatID)).Err()
-}
-
-func key(chatID int64) string {
-	return fmt.Sprintf("%s%d", keyPrefix, chatID)
+func (s *Store) Clear(chatID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.sessions, chatID)
 }

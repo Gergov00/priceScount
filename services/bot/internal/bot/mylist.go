@@ -5,65 +5,52 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/google/uuid"
 
-	"github.com/Gergov00/pricescount/shared/pkg/broker"
-	"github.com/Gergov00/pricescount/shared/pkg/contracts"
+	"github.com/Gergov00/pricescount/services/bot/internal/gateway"
 )
 
-type subscription struct {
-	ID        string
-	ProductID string
-	Name      string
-	MinPrice  *float64
-	MaxPrice  *float64
-	Paused    bool
-	URLs      []string
-}
-
 func (b *Bot) handleMyList(ctx context.Context, chatID int64) {
-	subs, err := b.userSubscriptions(ctx, chatID)
+	subs, err := b.gw.ListSubscriptions(ctx, chatID)
 	if err != nil {
-		slog.Error("userSubscriptions failed", "error", err)
+		slog.Error("list subscriptions failed", "error", err)
 		b.send(chatID, "Не удалось загрузить список.")
 		return
 	}
 	if len(subs) == 0 {
-		b.send(chatID, "У тебя пока нет отслеживаемых товаров.\n\nПришли ссылку на товар с Wildberries или Ozon чтобы начать.")
+		b.send(chatID, "У тебя пока нет отслеживаемых товаров.\n\nПришли ссылку на товар с Wildberries чтобы начать.")
 		return
 	}
 
-	text, keyboard := b.buildMyList(subs)
+	text, keyboard := buildMyList(subs)
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.DisableWebPagePreview = true
 	msg.ReplyMarkup = keyboard
 	b.api.Send(msg)
 }
 
-// refreshMyList rewrites the existing mylist message in-place.
 func (b *Bot) refreshMyList(ctx context.Context, chatID int64, messageID int) {
-	subs, err := b.userSubscriptions(ctx, chatID)
+	subs, err := b.gw.ListSubscriptions(ctx, chatID)
 	if err != nil {
-		slog.Error("userSubscriptions failed on refresh", "error", err)
+		slog.Error("list subscriptions failed on refresh", "error", err)
 		return
 	}
 	if len(subs) == 0 {
-		edit := tgbotapi.NewEditMessageText(chatID, messageID, "У тебя больше нет отслеживаемых товаров.\n\nПришли ссылку на товар чтобы начать.")
+		edit := tgbotapi.NewEditMessageText(chatID, messageID,
+			"У тебя больше нет отслеживаемых товаров.\n\nПришли ссылку на товар чтобы начать.")
 		b.api.Send(edit)
 		return
 	}
 
-	text, keyboard := b.buildMyList(subs)
+	text, keyboard := buildMyList(subs)
 	editText := tgbotapi.NewEditMessageText(chatID, messageID, text)
 	editText.DisableWebPagePreview = true
 	b.api.Send(editText)
 	b.api.Send(tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, keyboard))
 }
 
-func (b *Bot) buildMyList(subs []subscription) (string, tgbotapi.InlineKeyboardMarkup) {
+func buildMyList(subs []gateway.Subscription) (string, tgbotapi.InlineKeyboardMarkup) {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("📋 Твои товары (%d):\n", len(subs)))
 	for i, s := range subs {
@@ -71,18 +58,18 @@ func (b *Bot) buildMyList(subs []subscription) (string, tgbotapi.InlineKeyboardM
 		if s.Paused {
 			status = " ⏸"
 		}
-		sb.WriteString(fmt.Sprintf("\n%d. %s%s\n", i+1, s.Name, status))
+		sb.WriteString(fmt.Sprintf("\n%d. %s%s\n", i+1, s.ProductName, status))
 		if s.MinPrice != nil && s.MaxPrice != nil {
 			sb.WriteString(fmt.Sprintf("   %.0f — %.0f ₽\n", *s.MinPrice, *s.MaxPrice))
 		}
-		for _, u := range s.URLs {
-			sb.WriteString(fmt.Sprintf("   • %s\n", u))
+		if s.ProductURL != "" {
+			sb.WriteString(fmt.Sprintf("   • %s\n", s.ProductURL))
 		}
 	}
 
 	rows := make([][]tgbotapi.InlineKeyboardButton, 0, len(subs)*3)
 	for _, s := range subs {
-		name := truncate(s.Name, 22)
+		name := truncate(s.ProductName, 22)
 		pauseBtn := tgbotapi.NewInlineKeyboardButtonData("⏸", "pause_sub:"+s.ID)
 		if s.Paused {
 			pauseBtn = tgbotapi.NewInlineKeyboardButtonData("▶", "resume_sub:"+s.ID)
@@ -97,7 +84,7 @@ func (b *Bot) buildMyList(subs []subscription) (string, tgbotapi.InlineKeyboardM
 				tgbotapi.NewInlineKeyboardButtonData("🔄 Проверить", "check_sub:"+s.ID),
 			),
 			tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("🗑 Удалить «"+truncate(s.Name, 20)+"»", "del_sub:"+s.ID),
+				tgbotapi.NewInlineKeyboardButtonData("🗑 Удалить «"+truncate(s.ProductName, 20)+"»", "del_sub:"+s.ID),
 			),
 		)
 	}
@@ -105,184 +92,61 @@ func (b *Bot) buildMyList(subs []subscription) (string, tgbotapi.InlineKeyboardM
 	return sb.String(), tgbotapi.NewInlineKeyboardMarkup(rows...)
 }
 
-func (b *Bot) userSubscriptions(ctx context.Context, chatID int64) ([]subscription, error) {
-	rows, err := b.db.Query(ctx, `
-		SELECT s.id, s.product_id, p.name, s.min_price, s.max_price, s.paused
-		FROM subscriptions s
-		JOIN products p ON p.id = s.product_id
-		WHERE s.chat_id = $1 AND s.active = true
-		ORDER BY s.created_at
-	`, chatID)
+func (b *Bot) findSubscription(ctx context.Context, chatID int64, subID string) (*gateway.Subscription, error) {
+	subs, err := b.gw.ListSubscriptions(ctx, chatID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list subscriptions: %w", err)
 	}
-	defer rows.Close()
-
-	var subs []subscription
-	for rows.Next() {
-		var s subscription
-		if err := rows.Scan(&s.ID, &s.ProductID, &s.Name, &s.MinPrice, &s.MaxPrice, &s.Paused); err != nil {
-			return nil, err
-		}
-		subs = append(subs, s)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
 	for i := range subs {
-		subs[i].URLs = b.productURLs(ctx, subs[i].ProductID)
+		if subs[i].ID == subID {
+			return &subs[i], nil
+		}
 	}
-	return subs, nil
-}
-
-func (b *Bot) productURLs(ctx context.Context, productID string) []string {
-	rows, err := b.db.Query(ctx,
-		`SELECT url FROM tracked_urls WHERE product_id = $1 AND active = true ORDER BY created_at`,
-		productID,
-	)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	var urls []string
-	for rows.Next() {
-		var u string
-		rows.Scan(&u)
-		urls = append(urls, u)
-	}
-	return urls
+	return nil, fmt.Errorf("subscription %s not found", subID)
 }
 
 func (b *Bot) handleHistory(ctx context.Context, chatID int64, subID string) {
-	var productID, productName string
-	err := b.db.QueryRow(ctx, `
-		SELECT s.product_id, p.name FROM subscriptions s
-		JOIN products p ON p.id = s.product_id
-		WHERE s.id = $1 AND s.chat_id = $2
-	`, subID, chatID).Scan(&productID, &productName)
+	sub, err := b.findSubscription(ctx, chatID, subID)
 	if err != nil {
 		b.send(chatID, "Подписка не найдена.")
 		return
 	}
 
-	type priceRow struct {
-		Price     float64
-		Currency  string
-		ScrapedAt time.Time
-		Source    string
-	}
-
-	dbRows, err := b.db.Query(ctx, `
-		SELECT ph.price, ph.currency, ph.scraped_at, tu.source
-		FROM price_history ph
-		JOIN tracked_urls tu ON tu.id = ph.url_id
-		WHERE tu.product_id = $1
-		ORDER BY ph.scraped_at DESC
-		LIMIT 15
-	`, productID)
+	points, err := b.gw.GetHistory(ctx, chatID, subID)
 	if err != nil {
-		slog.Error("price history query failed", "error", err)
+		slog.Error("get history failed", "sub_id", subID, "error", err)
 		b.send(chatID, "Не удалось загрузить историю.")
 		return
 	}
-	defer dbRows.Close()
 
-	var records []priceRow
-	for dbRows.Next() {
-		var r priceRow
-		if err := dbRows.Scan(&r.Price, &r.Currency, &r.ScrapedAt, &r.Source); err != nil {
-			continue
-		}
-		records = append(records, r)
-	}
-
-	if len(records) == 0 {
-		b.send(chatID, fmt.Sprintf("📊 %s\n\nИстория цен пока пуста — нажми 🔄 Проверить чтобы получить первые данные.", productName))
+	if len(points) == 0 {
+		b.send(chatID, fmt.Sprintf("📊 %s\n\nИстория цен пока пуста — нажми 🔄 Проверить чтобы получить первые данные.", sub.ProductName))
 		return
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("📊 История цен: %s\n\n", productName))
-	for _, r := range records {
-		sb.WriteString(fmt.Sprintf("%-12s  %.0f %s  %s\n",
-			r.Source,
-			r.Price,
-			r.Currency,
-			r.ScrapedAt.Local().Format("02.01 15:04"),
+	sb.WriteString(fmt.Sprintf("📊 История цен: %s\n\n", sub.ProductName))
+	for _, p := range points {
+		sb.WriteString(fmt.Sprintf("%.0f %s  %s\n",
+			p.Price,
+			p.Currency,
+			p.ScrapedAt.Local().Format("02.01 15:04"),
 		))
 	}
 	b.send(chatID, sb.String())
 }
 
 func (b *Bot) handleForceCheck(ctx context.Context, chatID int64, subID string) {
-	var productID, productName string
-	err := b.db.QueryRow(ctx, `
-		SELECT s.product_id, p.name FROM subscriptions s
-		JOIN products p ON p.id = s.product_id
-		WHERE s.id = $1 AND s.chat_id = $2
-	`, subID, chatID).Scan(&productID, &productName)
-	if err != nil {
-		b.send(chatID, "Подписка не найдена.")
+	if err := b.gw.ForceCheck(ctx, chatID, subID); err != nil {
+		slog.Error("force check failed", "sub_id", subID, "error", err)
+		b.send(chatID, "Не удалось запустить проверку. Попробуй снова.")
 		return
 	}
-
-	type urlEntry struct {
-		url      string
-		platform string
-	}
-	dbRows, err := b.db.Query(ctx,
-		`SELECT url, source FROM tracked_urls WHERE product_id = $1 AND active = true ORDER BY created_at`,
-		productID,
-	)
-	if err != nil {
-		slog.Error("force check: query urls failed", "error", err)
-		b.send(chatID, "Ошибка при запросе ссылок.")
-		return
-	}
-	defer dbRows.Close()
-	var entries []urlEntry
-	for dbRows.Next() {
-		var e urlEntry
-		if err := dbRows.Scan(&e.url, &e.platform); err != nil {
-			continue
-		}
-		entries = append(entries, e)
-	}
-
-	if len(entries) == 0 {
-		b.send(chatID, "Нет отслеживаемых ссылок для этого товара.")
-		return
-	}
-
-	published := 0
-	for _, e := range entries {
-		task := contracts.ScraperTask{
-			TaskID:      uuid.New().String(),
-			ProductID:   productID,
-			URL:         e.url,
-			Platform:    e.platform,
-			ScheduledAt: time.Now().UTC(),
-			Force:       true,
-		}
-		if err := b.broker.Publish(ctx, broker.QueueScraperTasks, task); err != nil {
-			slog.Error("force check publish failed", "url", e.url, "error", err)
-			continue
-		}
-		published++
-	}
-
-	b.send(chatID, fmt.Sprintf(
-		"🔄 Проверка запущена для %q\n\nОтправлено задач: %d из %d.\nРезультат придёт в течение минуты.",
-		productName, published, len(entries),
-	))
+	b.send(chatID, "🔄 Проверка запущена.\n\nРезультат придёт в течение минуты.")
 }
 
 func (b *Bot) pauseSubscription(ctx context.Context, chatID int64, messageID int, subID string) {
-	if _, err := b.db.Exec(ctx,
-		`UPDATE subscriptions SET paused = true WHERE id = $1 AND chat_id = $2`,
-		subID, chatID,
-	); err != nil {
+	if err := b.gw.PauseSubscription(ctx, chatID, subID); err != nil {
 		slog.Error("pause subscription failed", "error", err)
 		b.send(chatID, "Ошибка. Попробуй снова.")
 		return
@@ -291,10 +155,7 @@ func (b *Bot) pauseSubscription(ctx context.Context, chatID int64, messageID int
 }
 
 func (b *Bot) resumeSubscription(ctx context.Context, chatID int64, messageID int, subID string) {
-	if _, err := b.db.Exec(ctx,
-		`UPDATE subscriptions SET paused = false WHERE id = $1 AND chat_id = $2`,
-		subID, chatID,
-	); err != nil {
+	if err := b.gw.ResumeSubscription(ctx, chatID, subID); err != nil {
 		slog.Error("resume subscription failed", "error", err)
 		b.send(chatID, "Ошибка. Попробуй снова.")
 		return
@@ -303,10 +164,7 @@ func (b *Bot) resumeSubscription(ctx context.Context, chatID int64, messageID in
 }
 
 func (b *Bot) deleteSubscription(ctx context.Context, chatID int64, messageID int, subID string) {
-	if _, err := b.db.Exec(ctx,
-		`UPDATE subscriptions SET active = false WHERE id = $1 AND chat_id = $2`,
-		subID, chatID,
-	); err != nil {
+	if err := b.gw.DeleteSubscription(ctx, chatID, subID); err != nil {
 		slog.Error("delete subscription failed", "error", err)
 		b.send(chatID, "Ошибка удаления.")
 		return

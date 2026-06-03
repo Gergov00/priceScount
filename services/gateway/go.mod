@@ -1,4 +1,4 @@
-module github.com/Gergov00/pricescount/services/scheduler
+module github.com/Gergov00/pricescount/services/gateway
 
 go 1.26
 

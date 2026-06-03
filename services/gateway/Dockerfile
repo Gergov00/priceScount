@@ -1,5 +1,5 @@
 # Build context must be the repository root:
-#   docker build -f services/extractor/Dockerfile .
+#   docker build -f services/gateway/Dockerfile .
 FROM golang:1.26-alpine AS builder
 WORKDIR /build
 
@@ -12,13 +12,12 @@ COPY services/bot/go.mod       services/bot/go.mod
 COPY services/gateway/go.mod   services/gateway/go.mod
 RUN go work sync
 
-COPY shared/             shared/
-COPY services/extractor/ services/extractor/
-WORKDIR /build/services/extractor
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /bin/extractor ./cmd/
+COPY shared/            shared/
+COPY services/gateway/  services/gateway/
+WORKDIR /build/services/gateway
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /bin/gateway ./cmd/gateway/
 
 FROM alpine:3.21
-RUN apk add --no-cache ca-certificates tzdata chromium
-ENV CHROME_BIN=/usr/bin/chromium-browser
-COPY --from=builder /bin/extractor /bin/extractor
-ENTRYPOINT ["/bin/extractor"]
+RUN apk add --no-cache ca-certificates tzdata
+COPY --from=builder /bin/gateway /bin/gateway
+ENTRYPOINT ["/bin/gateway"]

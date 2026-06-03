@@ -1,22 +1,27 @@
 package config
 
-import "os"
+import (
+	"fmt"
+	"os"
+)
 
 type Config struct {
 	RabbitMQURL   string
-	PostgresDSN   string
 	TelegramToken string
 }
 
-func Load() Config {
-	return Config{
-		RabbitMQURL:   getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
-		PostgresDSN:   getEnv("POSTGRES_DSN", "postgres://pricescount:pricescount@localhost:5434/pricescount?sslmode=disable"),
+func Load() (*Config, error) {
+	c := &Config{
+		RabbitMQURL:   getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
 		TelegramToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
 	}
+	if c.TelegramToken == "" {
+		return nil, fmt.Errorf("TELEGRAM_BOT_TOKEN is required")
+	}
+	return c, nil
 }
 
-func getEnv(key, fallback string) string {
+func getenv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}

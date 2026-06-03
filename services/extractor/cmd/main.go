@@ -11,46 +11,39 @@ import (
 	"github.com/Gergov00/pricescount/shared/pkg/marketplace"
 	"github.com/Gergov00/pricescount/services/extractor/internal/config"
 	"github.com/Gergov00/pricescount/services/extractor/internal/consumer"
-	"github.com/Gergov00/pricescount/services/extractor/internal/dedup"
-	"github.com/Gergov00/pricescount/services/extractor/internal/publisher"
 )
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		slog.Error("config", "error", err)
+		os.Exit(1)
+	}
 
 	conn, err := broker.ConnectWithRetry(cfg.RabbitMQURL, 10)
 	if err != nil {
-		slog.Error("rabbitmq unavailable", "error", err)
+		slog.Error("rabbitmq connect", "error", err)
 		os.Exit(1)
 	}
 	defer conn.Close()
 
-	for _, q := range []string{broker.QueueScraperTasks, broker.QueuePriceResults} {
+	for _, q := range []string{
+		broker.QueueLookupTasks,
+		broker.QueueScraperTasks,
+		broker.QueuePriceResults,
+	} {
 		if err := conn.DeclareQueue(q); err != nil {
-			slog.Error("queue declare failed", "queue", q, "error", err)
+			slog.Error("declare queue", "queue", q, "error", err)
 			os.Exit(1)
 		}
 	}
 
-	dd, err := dedup.NewStore(cfg.RedisURL, cfg.ScrapedTTL)
-	if err != nil {
-		slog.Error("redis unavailable", "error", err)
-		os.Exit(1)
-	}
-	defer dd.Close()
-
 	wbClient := marketplace.NewWBClient()
 	defer wbClient.Close()
 
-	c := consumer.New(
-		conn,
-		dd,
-		wbClient,
-		marketplace.NewOzonClient(),
-		publisher.New(conn),
-	)
+	c := consumer.New(conn, wbClient)
 
 	ctx, cancel := context.WithCancel(context.Background())
 

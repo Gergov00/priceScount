@@ -7,11 +7,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/Gergov00/pricescount/shared/pkg/broker"
 	"github.com/Gergov00/pricescount/services/bot/internal/bot"
 	"github.com/Gergov00/pricescount/services/bot/internal/config"
+	"github.com/Gergov00/pricescount/services/bot/internal/gateway"
 	"github.com/Gergov00/pricescount/services/bot/internal/state"
 )
 
@@ -24,55 +22,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	db, err := pgxpool.New(ctx, cfg.PostgresDSN)
-	if err != nil {
-		slog.Error("postgres unavailable", "error", err)
-		os.Exit(1)
-	}
-	defer db.Close()
+	gw := gateway.New(cfg.GatewayURL)
+	st := state.New()
 
-	st, err := state.New(cfg.RedisURL)
-	if err != nil {
-		slog.Error("redis unavailable", "error", err)
-		os.Exit(1)
-	}
-
-	mq, err := broker.ConnectWithRetry(cfg.RabbitMQURL, 10)
-	if err != nil {
-		slog.Error("rabbitmq unavailable", "error", err)
-		os.Exit(1)
-	}
-	defer mq.Close()
-
-	if err := mq.DeclareQueue(broker.QueueDiscoveryURLs); err != nil {
-		slog.Error("declare queue failed", "error", err)
-		os.Exit(1)
-	}
-	if err := mq.DeclareQueue(broker.QueueScraperTasks); err != nil {
-		slog.Error("declare queue failed", "error", err)
-		os.Exit(1)
-	}
-
-	b, err := bot.New(cfg.TelegramToken, st, db, mq)
+	b, err := bot.New(cfg.TelegramToken, st, gw)
 	if err != nil {
 		slog.Error("bot init failed", "error", err)
 		os.Exit(1)
 	}
-	defer b.Close()
 
-	go func() {
-		if err := b.Run(ctx); err != nil {
-			slog.Error("bot error", "error", err)
-		}
-	}()
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-
-	cancel()
+	if err := b.Run(ctx); err != nil {
+		slog.Error("bot error", "error", err)
+	}
 	slog.Info("bot stopped")
 }

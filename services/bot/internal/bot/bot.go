@@ -8,39 +8,23 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/Gergov00/pricescount/shared/pkg/broker"
-	"github.com/Gergov00/pricescount/shared/pkg/marketplace"
+	"github.com/Gergov00/pricescount/services/bot/internal/gateway"
 	"github.com/Gergov00/pricescount/services/bot/internal/state"
 )
 
 type Bot struct {
-	api    *tgbotapi.BotAPI
-	wb     *marketplace.WBClient
-	ozon   *marketplace.OzonClient
-	state  *state.Store
-	db     *pgxpool.Pool
-	broker *broker.Connection
+	api   *tgbotapi.BotAPI
+	gw    *gateway.Client
+	state *state.Store
 }
 
-func (b *Bot) Close() {
-	b.wb.Close()
-}
-
-func New(token string, st *state.Store, db *pgxpool.Pool, mq *broker.Connection) (*Bot, error) {
+func New(token string, st *state.Store, gw *gateway.Client) (*Bot, error) {
 	api, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		return nil, fmt.Errorf("bot api: %w", err)
 	}
-	b := &Bot{
-		api:    api,
-		wb:     marketplace.NewWBClient(),
-		ozon:   marketplace.NewOzonClient(),
-		state:  st,
-		db:     db,
-		broker: mq,
-	}
+	b := &Bot{api: api, gw: gw, state: st}
 	b.registerCommands()
 	return b, nil
 }
@@ -78,9 +62,9 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
 
 	if msg.Text == "/start" || msg.Text == "/cancel" {
-		b.state.Clear(ctx, chatID)
+		b.state.Clear(chatID)
 		reply := tgbotapi.NewMessage(chatID,
-			"Привет! Пришли ссылку на товар с Wildberries или Ozon — я начну следить за ценой.\n\n"+
+			"Привет! Пришли ссылку на товар с Wildberries — я начну следить за ценой.\n\n"+
 				"Пример:\nhttps://www.wildberries.ru/catalog/12345678/detail.aspx")
 		reply.ReplyMarkup = mainKeyboard()
 		b.api.Send(reply)
@@ -88,20 +72,18 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 	}
 
 	if msg.Text == "/mylist" || msg.Text == "📋 Мои товары" {
-		b.state.Clear(ctx, chatID)
+		b.state.Clear(chatID)
 		b.handleMyList(ctx, chatID)
 		return
 	}
 
-	sess, err := b.state.Get(ctx, chatID)
-	if err != nil {
-		b.send(chatID, "Внутренняя ошибка, попробуй снова.")
-		return
-	}
+	sess := b.state.Get(chatID)
 
 	switch sess.Step {
 	case state.StepIdle:
 		b.handleURLSubmit(ctx, chatID, msg.Text)
+	case state.StepWaitingLookup:
+		b.send(chatID, "Подожди, загружаю товар...")
 	case state.StepWaitingMinPrice:
 		b.handleMinPrice(ctx, chatID, sess, msg.Text)
 	case state.StepWaitingMaxPrice:

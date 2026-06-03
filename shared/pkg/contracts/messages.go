@@ -2,35 +2,52 @@ package contracts
 
 import "time"
 
-// DiscoveredURL is published to the discovery.urls queue when a user submits a product URL.
-type DiscoveredURL struct {
-	ProductID    string    `json:"product_id"`
-	ProductName  string    `json:"product_name"`
-	URL          string    `json:"url"`
-	Platform     string    `json:"platform"`  // "wb" or "ozon"
-	Source       string    `json:"source"`    // same as Platform, kept for DB compatibility
-	DiscoveredAt time.Time `json:"discovered_at"`
+// LookupTask is published to the lookup.tasks queue for a one-time product fetch.
+type LookupTask struct {
+	TaskID   string `json:"task_id"`
+	LookupID string `json:"lookup_id"`
+	URL      string `json:"url"`
+	Platform string `json:"platform"` // "wb"
 }
 
-// ScraperTask is published to the scraper.tasks queue by the Scheduler Service.
+// ScraperTask is published to the scraper.tasks queue by the Scheduler for periodic monitoring.
 type ScraperTask struct {
 	TaskID      string    `json:"task_id"`
 	ProductID   string    `json:"product_id"`
 	URL         string    `json:"url"`
-	Platform    string    `json:"platform"`              // "wb" or "ozon"
+	Platform    string    `json:"platform"` // "wb"
 	ScheduledAt time.Time `json:"scheduled_at"`
 	Force       bool      `json:"force,omitempty"`
 }
 
-// PriceResult is published to the price.results queue by the Extractor Service.
+// PriceResult is published to the price.results queue by the Extractor.
+// Either LookupID or ProductID is set — never both.
 type PriceResult struct {
 	TaskID    string    `json:"task_id"`
-	ProductID string    `json:"product_id"`
+	LookupID  string    `json:"lookup_id,omitempty"`  // set for lookup.tasks responses
+	ProductID string    `json:"product_id,omitempty"` // set for scraper.tasks responses
 	URL       string    `json:"url"`
+	Name      string    `json:"name,omitempty"` // only populated for lookups
 	Price     float64   `json:"price"`
 	Currency  string    `json:"currency"`
 	ScrapedAt time.Time `json:"scraped_at"`
 	Success   bool      `json:"success"`
 	Error     string    `json:"error,omitempty"`
-	Force     bool      `json:"force,omitempty"`
+}
+
+// TrackRequest is published to the track.requests queue to manage scheduled monitoring.
+type TrackRequest struct {
+	Action        string `json:"action"`                   // add | pause | resume | delete | force
+	ProductID     string `json:"product_id"`
+	URL           string `json:"url"`
+	Platform      string `json:"platform"`
+	IntervalHours int    `json:"interval_hours,omitempty"` // used with action=add
+}
+
+// NotifyTask is published to the notify.tasks queue for delivery to the user.
+type NotifyTask struct {
+	Channel   string `json:"channel"`             // telegram | email | push
+	Target    string `json:"target"`              // chat_id (as string), email, device token
+	Text      string `json:"text"`
+	Direction string `json:"direction,omitempty"` // up | down
 }

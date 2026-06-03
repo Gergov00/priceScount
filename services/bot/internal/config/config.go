@@ -4,17 +4,13 @@ import "os"
 
 type Config struct {
 	TelegramToken string
-	RedisURL      string
-	PostgresDSN   string
-	RabbitMQURL   string
+	GatewayURL    string
 }
 
 func Load() Config {
 	return Config{
 		TelegramToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
-		RedisURL:      getEnv("REDIS_URL", "redis://localhost:6379"),
-		PostgresDSN:   getEnv("POSTGRES_DSN", "postgres://pricescount:pricescount@localhost:5434/pricescount?sslmode=disable"),
-		RabbitMQURL:   getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
+		GatewayURL:    getEnv("GATEWAY_URL", "http://localhost:8080"),
 	}
 }
 

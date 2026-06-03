@@ -14,19 +14,6 @@ services:
       retries: 10
       start_period: 30s
 
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    command: redis-server --appendonly yes
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
   postgres:
     image: postgres:16-alpine
     environment:
@@ -45,6 +32,24 @@ services:
       retries: 10
       start_period: 20s
 
+  gateway:
+    build:
+      context: .
+      dockerfile: services/gateway/Dockerfile
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DSN: postgresql://pricescount:pricescount@postgres:5432/pricescount?sslmode=disable
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    ports:
+      - "8080:8080"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
   scheduler:
     build:
       context: .
@@ -53,12 +58,12 @@ services:
       - .env
     environment:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      REDIS_URL: redis://redis:6379
+      POSTGRES_DSN: postgresql://pricescount:pricescount@postgres:5432/pricescount?sslmode=disable
       CHECK_INTERVAL_MINUTES: "1"
     depends_on:
       rabbitmq:
         condition: service_healthy
-      redis:
+      postgres:
         condition: service_healthy
     restart: unless-stopped
 
@@ -70,31 +75,8 @@ services:
       - .env
     environment:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      REDIS_URL: redis://redis:6379
-      CHECK_INTERVAL_MINUTES: "1"
     depends_on:
       rabbitmq:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
-
-  bot:
-    build:
-      context: .
-      dockerfile: services/bot/Dockerfile
-    env_file:
-      - .env
-    environment:
-      REDIS_URL: redis://redis:6379
-      POSTGRES_DSN: postgresql://pricescount:pricescount@postgres:5432/pricescount?sslmode=disable
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      postgres:
         condition: service_healthy
     restart: unless-stopped
 
@@ -106,14 +88,23 @@ services:
       - .env
     environment:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      POSTGRES_DSN: postgresql://pricescount:pricescount@postgres:5432/pricescount?sslmode=disable
     depends_on:
       rabbitmq:
         condition: service_healthy
-      postgres:
-        condition: service_healthy
+    restart: unless-stopped
+
+  bot:
+    build:
+      context: .
+      dockerfile: services/bot/Dockerfile
+    env_file:
+      - .env
+    environment:
+      GATEWAY_URL: http://gateway:8080
+    depends_on:
+      gateway:
+        condition: service_started
     restart: unless-stopped
 
 volumes:
   postgres_data:
-  redis_data:

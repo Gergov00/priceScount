@@ -9,37 +9,29 @@ import (
 )
 
 func (b *Bot) startEditSubscription(ctx context.Context, chatID int64, subID string) {
-	var name string
-	var minPrice, maxPrice *float64
-	err := b.db.QueryRow(ctx, `
-		SELECT p.name, s.min_price, s.max_price
-		FROM subscriptions s
-		JOIN products p ON p.id = s.product_id
-		WHERE s.id = $1 AND s.chat_id = $2
-	`, subID, chatID).Scan(&name, &minPrice, &maxPrice)
+	sub, err := b.findSubscription(ctx, chatID, subID)
 	if err != nil {
 		b.send(chatID, "Подписка не найдена.")
 		return
 	}
 
 	var oldMin, oldMax float64
-	if minPrice != nil {
-		oldMin = *minPrice
+	if sub.MinPrice != nil {
+		oldMin = *sub.MinPrice
 	}
-	if maxPrice != nil {
-		oldMax = *maxPrice
+	if sub.MaxPrice != nil {
+		oldMax = *sub.MaxPrice
 	}
 
-	sess := &state.Session{
+	b.state.Set(chatID, &state.Session{
 		Step:         state.StepEditingMinPrice,
 		EditingSubID: subID,
 		OldMinPrice:  oldMin,
 		OldMaxPrice:  oldMax,
-	}
-	b.state.Set(ctx, chatID, sess)
+	})
 	b.send(chatID, fmt.Sprintf(
 		"Редактирую %q\n\nУкажи новую минимальную цену (сейчас: %.0f ₽):",
-		name, oldMin,
+		sub.ProductName, oldMin,
 	))
 }
 
@@ -51,7 +43,7 @@ func (b *Bot) handleEditMinPrice(ctx context.Context, chatID int64, sess *state.
 	}
 	sess.MinPrice = price
 	sess.Step = state.StepEditingMaxPrice
-	b.state.Set(ctx, chatID, sess)
+	b.state.Set(chatID, sess)
 	b.send(chatID, fmt.Sprintf(
 		"Теперь укажи новую максимальную цену (сейчас: %.0f ₽):",
 		sess.OldMaxPrice,
@@ -69,15 +61,13 @@ func (b *Bot) handleEditMaxPrice(ctx context.Context, chatID int64, sess *state.
 		return
 	}
 
-	if _, err := b.db.Exec(ctx, `
-		UPDATE subscriptions SET min_price = $1, max_price = $2 WHERE id = $3 AND chat_id = $4
-	`, sess.MinPrice, price, sess.EditingSubID, chatID); err != nil {
-		slog.Error("update subscription failed", "error", err)
+	if err := b.gw.EditSubscription(ctx, chatID, sess.EditingSubID, sess.MinPrice, price); err != nil {
+		slog.Error("edit subscription failed", "error", err)
 		b.send(chatID, "Ошибка обновления. Попробуй снова.")
 		return
 	}
 
-	b.state.Clear(ctx, chatID)
+	b.state.Clear(chatID)
 	b.send(chatID, fmt.Sprintf(
 		"Готово! Новый диапазон: %.0f — %.0f ₽\n\n/mylist — посмотреть все товары",
 		sess.MinPrice, price,

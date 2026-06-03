@@ -11,19 +11,21 @@ import (
 )
 
 const (
-	QueueDiscoveryURLs = "discovery.urls"
+	QueueLookupTasks   = "lookup.tasks"
 	QueueScraperTasks  = "scraper.tasks"
 	QueuePriceResults  = "price.results"
+	QueueTrackRequests = "track.requests"
+	QueueNotifyTasks   = "notify.tasks"
 )
 
-// Connection wraps an AMQP connection and channel.
+// Connection wraps an AMQP connection and a default channel.
 type Connection struct {
 	url  string
 	conn *amqp.Connection
 	ch   *amqp.Channel
 }
 
-// NewConnection dials RabbitMQ and opens a channel with a prefetch of 10.
+// NewConnection dials RabbitMQ and opens a default channel with prefetch=10.
 func NewConnection(rawURL string) (*Connection, error) {
 	c := &Connection{url: rawURL}
 	return c, c.dial()
@@ -55,7 +57,6 @@ func (c *Connection) dial() error {
 		conn.Close()
 		return fmt.Errorf("open channel: %w", err)
 	}
-	// Workers ack manually; limit in-flight messages per consumer.
 	if err := ch.Qos(10, 0, false); err != nil {
 		ch.Close()
 		conn.Close()
@@ -85,9 +86,34 @@ func (c *Connection) Publish(ctx context.Context, queue string, v any) error {
 	})
 }
 
-// Consume registers a consumer on queue. Messages must be acked/nacked by the caller.
+// Consume registers a consumer on queue using the default channel (prefetch=10).
+// Messages must be acked/nacked by the caller.
 func (c *Connection) Consume(queue, consumer string) (<-chan amqp.Delivery, error) {
 	return c.ch.Consume(queue, consumer, false, false, false, false, nil)
+}
+
+// ConsumeWithPrefetch opens a dedicated channel with the given prefetch count and
+// registers a consumer. Use this when different consumers need different prefetch
+// values (e.g. lookup.tasks prefetch=1, scraper.tasks prefetch=2).
+func (c *Connection) ConsumeWithPrefetch(queue, consumer string, prefetch int) (<-chan amqp.Delivery, error) {
+	ch, err := c.conn.Channel()
+	if err != nil {
+		return nil, fmt.Errorf("open channel for %s: %w", queue, err)
+	}
+	if err := ch.Qos(prefetch, 0, false); err != nil {
+		ch.Close()
+		return nil, fmt.Errorf("qos for %s: %w", queue, err)
+	}
+	if _, err := ch.QueueDeclare(queue, true, false, false, false, nil); err != nil {
+		ch.Close()
+		return nil, fmt.Errorf("declare queue %s: %w", queue, err)
+	}
+	deliveries, err := ch.Consume(queue, consumer, false, false, false, false, nil)
+	if err != nil {
+		ch.Close()
+		return nil, fmt.Errorf("consume %s: %w", queue, err)
+	}
+	return deliveries, nil
 }
 
 func (c *Connection) Close() {
