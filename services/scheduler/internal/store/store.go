@@ -54,6 +54,18 @@ func (s *Store) SetNextCheck(ctx context.Context, url string) error {
 	return err
 }
 
+// AdvanceNextCheck moves next_check_at forward by the configured interval so the
+// tick does not immediately redispatch after a force-publish.
+func (s *Store) AdvanceNextCheck(ctx context.Context, url string) error {
+	_, err := s.db.Exec(ctx,
+		`UPDATE scheduled_urls
+		 SET next_check_at = NOW() + (check_interval_hours * interval '1 hour'), active = true
+		 WHERE url = $1`,
+		url,
+	)
+	return err
+}
+
 // Delete removes a URL from the schedule entirely.
 func (s *Store) Delete(ctx context.Context, url string) error {
 	_, err := s.db.Exec(ctx, `DELETE FROM scheduled_urls WHERE url=$1`, url)

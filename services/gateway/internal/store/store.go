@@ -295,6 +295,36 @@ type TriggeredSub struct {
 	MaxPrice    float64
 }
 
+// ActiveSubscriptions returns all active non-paused subscriptions for a product.
+// Used for force-check results where we notify regardless of price thresholds.
+func (s *Store) ActiveSubscriptions(ctx context.Context, productID string) ([]TriggeredSub, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT u.id, u.chat_id, p.name, p.url, COALESCE(s.min_price, 0), COALESCE(s.max_price, 0)
+		 FROM subscriptions s
+		 JOIN users u ON u.id = s.user_id
+		 JOIN products p ON p.id = s.product_id
+		 WHERE s.product_id = $1
+		   AND s.active = true
+		   AND s.paused = false`,
+		productID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("active subscriptions: %w", err)
+	}
+	defer rows.Close()
+
+	var subs []TriggeredSub
+	for rows.Next() {
+		var sub TriggeredSub
+		if err := rows.Scan(&sub.UserID, &sub.ChatID, &sub.ProductName, &sub.ProductURL,
+			&sub.MinPrice, &sub.MaxPrice); err != nil {
+			return nil, err
+		}
+		subs = append(subs, sub)
+	}
+	return subs, rows.Err()
+}
+
 func (s *Store) TriggeredSubscriptions(ctx context.Context, productID string, price float64) ([]TriggeredSub, error) {
 	rows, err := s.db.Query(ctx,
 		`SELECT u.id, u.chat_id, p.name, p.url, s.min_price, s.max_price

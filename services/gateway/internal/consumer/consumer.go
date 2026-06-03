@@ -98,32 +98,48 @@ func (c *Consumer) handleMonitoring(ctx context.Context, d amqp.Delivery, result
 		return
 	}
 
-	subs, err := c.store.TriggeredSubscriptions(ctx, result.ProductID, result.Price)
+	var subs []store.TriggeredSub
+	var err error
+	if result.Force {
+		subs, err = c.store.ActiveSubscriptions(ctx, result.ProductID)
+	} else {
+		subs, err = c.store.TriggeredSubscriptions(ctx, result.ProductID, result.Price)
+	}
 	if err != nil {
-		log.Error("triggered subscriptions query failed", "product_id", result.ProductID, "error", err)
+		log.Error("subscriptions query failed", "product_id", result.ProductID, "error", err)
 		d.Ack(false)
 		return
 	}
 
 	for _, sub := range subs {
-		direction := "down"
-		if result.Price > sub.MaxPrice {
-			direction = "up"
+		var text string
+		if result.Force {
+			text = formatStatus(sub.ProductName, sub.ProductURL, result.Price, result.Currency, sub.MinPrice, sub.MaxPrice)
+		} else {
+			direction := "down"
+			if result.Price > sub.MaxPrice {
+				direction = "up"
+			}
+			text = formatAlert(sub.ProductName, sub.ProductURL, result.Price, result.Currency, direction, sub.MinPrice, sub.MaxPrice)
 		}
-
-		text := formatAlert(sub.ProductName, sub.ProductURL, result.Price, result.Currency, direction, sub.MinPrice, sub.MaxPrice)
 		task := contracts.NotifyTask{
-			Channel:   "telegram",
-			Target:    strconv.FormatInt(sub.ChatID, 10),
-			Text:      text,
-			Direction: direction,
+			Channel: "telegram",
+			Target:  strconv.FormatInt(sub.ChatID, 10),
+			Text:    text,
+		}
+		if !result.Force {
+			if result.Price < sub.MinPrice {
+				task.Direction = "down"
+			} else {
+				task.Direction = "up"
+			}
 		}
 		if err := c.mq.Publish(ctx, broker.QueueNotifyTasks, task); err != nil {
 			log.Error("publish notify task failed", "chat_id", sub.ChatID, "error", err)
 		}
 	}
 
-	log.Info("monitoring result processed", "product_id", result.ProductID, "price", result.Price, "alerts", len(subs))
+	log.Info("monitoring result processed", "product_id", result.ProductID, "price", result.Price, "alerts", len(subs), "force", result.Force)
 	d.Ack(false)
 }
 
@@ -134,4 +150,9 @@ func formatAlert(name, url string, price float64, currency, direction string, mi
 	}
 	return fmt.Sprintf("📈 Цена выросла!\n\n%s\n%s\n\nЦена: %.0f %s\nВаш максимум: %.0f %s",
 		name, url, price, currency, maxPrice, currency)
+}
+
+func formatStatus(name, url string, price float64, currency string, minPrice, maxPrice float64) string {
+	return fmt.Sprintf("📊 Текущая цена\n\n%s\n%s\n\nЦена: %.0f %s\nДиапазон: %.0f — %.0f %s",
+		name, url, price, currency, minPrice, maxPrice, currency)
 }

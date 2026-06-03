@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"time"
 
+	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/Gergov00/pricescount/shared/pkg/broker"
@@ -68,7 +70,7 @@ func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
 	case "delete":
 		err = c.store.Delete(ctx, req.URL)
 	case "force":
-		err = c.store.SetNextCheck(ctx, req.URL)
+		err = c.handleForce(ctx, req)
 	default:
 		log.Error("unknown action, dropping")
 		d.Nack(false, false)
@@ -83,4 +85,21 @@ func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
 
 	log.Info("track request processed")
 	d.Ack(false)
+}
+
+// handleForce publishes a ScraperTask immediately (bypassing the tick) and advances
+// next_check_at so the tick does not redispatch within the same interval.
+func (c *Consumer) handleForce(ctx context.Context, req contracts.TrackRequest) error {
+	task := contracts.ScraperTask{
+		TaskID:      uuid.New().String(),
+		ProductID:   req.ProductID,
+		URL:         req.URL,
+		Platform:    req.Platform,
+		ScheduledAt: time.Now().UTC(),
+		Force:       true,
+	}
+	if err := c.conn.Publish(ctx, broker.QueueScraperTasks, task); err != nil {
+		return fmt.Errorf("publish force scraper task: %w", err)
+	}
+	return c.store.AdvanceNextCheck(ctx, req.URL)
 }

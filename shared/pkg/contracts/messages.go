@@ -33,6 +33,7 @@ type PriceResult struct {
 	ScrapedAt time.Time `json:"scraped_at"`
 	Success   bool      `json:"success"`
 	Error     string    `json:"error,omitempty"`
+	Force     bool      `json:"force,omitempty"` // true when triggered by user force-check
 }
 
 // TrackRequest is published to the track.requests queue to manage scheduled monitoring.
