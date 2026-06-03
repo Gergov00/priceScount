@@ -1,13 +1,14 @@
 package handler
 
 import (
-	"encoding/json"
-	"errors"
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
 	"github.com/Gergov00/pricescount/shared/pkg/broker"
@@ -16,59 +17,79 @@ import (
 	"github.com/Gergov00/pricescount/services/gateway/internal/store"
 )
 
-type Handler struct {
-	store *store.Store
-	mq    *broker.Connection
+// Store is the persistence interface required by Handler.
+// Defined here, in the consumer, per Go convention.
+type Store interface {
+	CreateLookup(ctx context.Context, id, url string) error
+	GetLookup(ctx context.Context, id string) (*store.LookupResult, error)
+	UpsertUser(ctx context.Context, chatID int64) (string, error)
+	ProductIDByURL(ctx context.Context, url string) (string, error)
+	UpsertProduct(ctx context.Context, id, name, url, platform string) error
+	CreateSubscription(ctx context.Context, userID, productID string, minPrice, maxPrice float64) (string, error)
+	UserSubscriptions(ctx context.Context, userID string) ([]store.Subscription, error)
+	GetSubscription(ctx context.Context, subID, userID string) (*store.Subscription, error)
+	PauseSubscription(ctx context.Context, subID, userID string) error
+	ResumeSubscription(ctx context.Context, subID, userID string) error
+	UpdateThresholds(ctx context.Context, subID, userID string, minPrice, maxPrice float64) error
+	DeleteSubscription(ctx context.Context, subID, userID string) error
+	PriceHistory(ctx context.Context, productID string, limit int) ([]store.PricePoint, error)
 }
 
-func New(st *store.Store, mq *broker.Connection) *Handler {
+// Publisher is the messaging interface required by Handler.
+type Publisher interface {
+	Publish(ctx context.Context, queue string, v any) error
+}
+
+type Handler struct {
+	store Store
+	mq    Publisher
+}
+
+func New(st Store, mq Publisher) *Handler {
 	return &Handler{store: st, mq: mq}
 }
 
-func (h *Handler) Register(mux *http.ServeMux) {
-	mux.HandleFunc("POST /lookup", h.postLookup)
-	mux.HandleFunc("GET /lookup/{id}", h.getLookup)
-	mux.HandleFunc("POST /subscriptions", h.postSubscription)
-	mux.HandleFunc("GET /subscriptions", h.listSubscriptions)
-	mux.HandleFunc("PATCH /subscriptions/{id}", h.patchSubscription)
-	mux.HandleFunc("DELETE /subscriptions/{id}", h.deleteSubscription)
-	mux.HandleFunc("GET /subscriptions/{id}/history", h.getHistory)
-	mux.HandleFunc("POST /subscriptions/{id}/check", h.postCheck)
+func (h *Handler) Register(r *gin.Engine) {
+	r.POST("/lookup", h.postLookup)
+	r.GET("/lookup/:id", h.getLookup)
+
+	subs := r.Group("/subscriptions")
+	subs.POST("", h.postSubscription)
+	subs.GET("", h.listSubscriptions)
+	subs.PATCH("/:id", h.patchSubscription)
+	subs.DELETE("/:id", h.deleteSubscription)
+	subs.GET("/:id/history", h.getHistory)
+	subs.POST("/:id/check", h.postCheck)
 }
 
 // ─── POST /lookup ─────────────────────────────────────────────────────────────
 
 type postLookupRequest struct {
-	URL string `json:"url"`
+	URL string `json:"url" binding:"required"`
 }
 
-func (h *Handler) postLookup(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) postLookup(c *gin.Context) {
 	var req postLookupRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-	if req.URL == "" {
-		writeError(w, http.StatusBadRequest, "url is required")
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "url is required"})
 		return
 	}
 
 	plat, err := platform.Detect(req.URL)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-
 	normalURL, err := normalizeURL(plat, req.URL)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "cannot parse product url")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot parse product url"})
 		return
 	}
 
 	lookupID := uuid.New().String()
-	if err := h.store.CreateLookup(r.Context(), lookupID, normalURL); err != nil {
+	if err := h.store.CreateLookup(c.Request.Context(), lookupID, normalURL); err != nil {
 		slog.Error("create lookup", "error", err)
-		writeError(w, http.StatusInternalServerError, "internal error")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
 
@@ -78,352 +99,344 @@ func (h *Handler) postLookup(w http.ResponseWriter, r *http.Request) {
 		URL:      normalURL,
 		Platform: plat,
 	}
-	if err := h.mq.Publish(r.Context(), broker.QueueLookupTasks, task); err != nil {
+	if err := h.mq.Publish(c.Request.Context(), broker.QueueLookupTasks, task); err != nil {
 		slog.Error("publish lookup task", "error", err)
-		writeError(w, http.StatusInternalServerError, "internal error")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
 
-	writeJSON(w, http.StatusAccepted, map[string]string{"lookup_id": lookupID})
+	c.JSON(http.StatusAccepted, gin.H{"lookup_id": lookupID})
 }
 
-// ─── GET /lookup/{id} ─────────────────────────────────────────────────────────
+// ─── GET /lookup/:id ─────────────────────────────────────────────────────────
 
-func (h *Handler) getLookup(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	result, err := h.store.GetLookup(r.Context(), id)
+func (h *Handler) getLookup(c *gin.Context) {
+	result, err := h.store.GetLookup(c.Request.Context(), c.Param("id"))
 	if err != nil {
-		writeError(w, http.StatusNotFound, "lookup not found")
+		c.JSON(http.StatusNotFound, gin.H{"error": "lookup not found"})
 		return
 	}
 
 	switch result.Status {
 	case store.LookupPending:
-		writeJSON(w, http.StatusAccepted, map[string]string{"status": "pending"})
+		c.JSON(http.StatusAccepted, gin.H{"status": "pending"})
 	case store.LookupDone:
-		writeJSON(w, http.StatusOK, map[string]any{
+		c.JSON(http.StatusOK, gin.H{
 			"status": "done",
 			"name":   result.Name,
 			"price":  result.Price,
 			"url":    result.URL,
 		})
 	case store.LookupFailed:
-		writeJSON(w, http.StatusOK, map[string]string{
-			"status": "failed",
-			"error":  result.Error,
-		})
+		c.JSON(http.StatusOK, gin.H{"status": "failed", "error": result.Error})
 	}
 }
 
-// ─── POST /subscriptions ──────────────────────────────────────────────────────
+// ─── POST /subscriptions ─────────────────────────────────────────────────────
 
 type postSubscriptionRequest struct {
-	ChatID   int64   `json:"chat_id"`
-	LookupID string  `json:"lookup_id"`
+	ChatID   int64   `json:"chat_id"  binding:"required"`
+	LookupID string  `json:"lookup_id" binding:"required"`
 	MinPrice float64 `json:"min_price"`
 	MaxPrice float64 `json:"max_price"`
 }
 
-func (h *Handler) postSubscription(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) postSubscription(c *gin.Context) {
 	var req postSubscriptionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-	if req.ChatID == 0 || req.LookupID == "" {
-		writeError(w, http.StatusBadRequest, "chat_id and lookup_id are required")
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "chat_id and lookup_id are required"})
 		return
 	}
 	if req.MaxPrice <= req.MinPrice {
-		writeError(w, http.StatusBadRequest, "max_price must be greater than min_price")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "max_price must be greater than min_price"})
 		return
 	}
 
-	lookup, err := h.store.GetLookup(r.Context(), req.LookupID)
+	ctx := c.Request.Context()
+
+	lookup, err := h.store.GetLookup(ctx, req.LookupID)
 	if err != nil || lookup.Status != store.LookupDone {
-		writeError(w, http.StatusBadRequest, "lookup not found or not completed")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "lookup not found or not completed"})
 		return
 	}
 
-	userID, err := h.store.UpsertUser(r.Context(), req.ChatID)
+	userID, err := h.store.UpsertUser(ctx, req.ChatID)
 	if err != nil {
 		slog.Error("upsert user", "chat_id", req.ChatID, "error", err)
-		writeError(w, http.StatusInternalServerError, "internal error")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
 
 	plat, _ := platform.Detect(lookup.URL)
 
-	// Reuse existing product if same URL already tracked, otherwise create new.
-	productID, err := h.store.ProductIDByURL(r.Context(), lookup.URL)
+	productID, err := h.store.ProductIDByURL(ctx, lookup.URL)
 	if err != nil {
 		productID = uuid.New().String()
 	}
 
-	if err := h.store.UpsertProduct(r.Context(), productID, lookup.Name, lookup.URL, plat); err != nil {
+	if err := h.store.UpsertProduct(ctx, productID, lookup.Name, lookup.URL, plat); err != nil {
 		slog.Error("upsert product", "error", err)
-		writeError(w, http.StatusInternalServerError, "internal error")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
 
-	subID, err := h.store.CreateSubscription(r.Context(), userID, productID, req.MinPrice, req.MaxPrice)
+	subID, err := h.store.CreateSubscription(ctx, userID, productID, req.MinPrice, req.MaxPrice)
 	if err != nil {
 		slog.Error("create subscription", "error", err)
-		writeError(w, http.StatusInternalServerError, "internal error")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
 
-	track := contracts.TrackRequest{
+	if err := h.mq.Publish(ctx, broker.QueueTrackRequests, contracts.TrackRequest{
 		Action:        "add",
 		ProductID:     productID,
 		URL:           lookup.URL,
 		Platform:      plat,
 		IntervalHours: 1,
-	}
-	if err := h.mq.Publish(r.Context(), broker.QueueTrackRequests, track); err != nil {
+	}); err != nil {
 		slog.Error("publish track request", "error", err)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{
-		"subscription_id": subID,
-		"product_id":      productID,
-	})
+	c.JSON(http.StatusOK, gin.H{"subscription_id": subID, "product_id": productID})
 }
 
 // ─── GET /subscriptions ───────────────────────────────────────────────────────
 
-func (h *Handler) listSubscriptions(w http.ResponseWriter, r *http.Request) {
-	chatID, err := parseChatID(r.URL.Query().Get("chat_id"))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid chat_id")
+func (h *Handler) listSubscriptions(c *gin.Context) {
+	chatID, err := strconv.ParseInt(c.Query("chat_id"), 10, 64)
+	if err != nil || chatID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid chat_id"})
 		return
 	}
 
-	userID, err := h.store.UpsertUser(r.Context(), chatID)
+	ctx := c.Request.Context()
+
+	userID, err := h.store.UpsertUser(ctx, chatID)
 	if err != nil {
 		slog.Error("upsert user", "chat_id", chatID, "error", err)
-		writeError(w, http.StatusInternalServerError, "internal error")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
 
-	subs, err := h.store.UserSubscriptions(r.Context(), userID)
+	subs, err := h.store.UserSubscriptions(ctx, userID)
 	if err != nil {
 		slog.Error("list subscriptions", "error", err)
-		writeError(w, http.StatusInternalServerError, "internal error")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
 
 	if subs == nil {
 		subs = []store.Subscription{}
 	}
-	writeJSON(w, http.StatusOK, subs)
+	c.JSON(http.StatusOK, subs)
 }
 
-// ─── PATCH /subscriptions/{id} ────────────────────────────────────────────────
+// ─── PATCH /subscriptions/:id ─────────────────────────────────────────────────
 
 type patchSubscriptionRequest struct {
-	ChatID   int64    `json:"chat_id"`
-	Action   string   `json:"action"` // pause | resume | edit
-	MinPrice *float64 `json:"min_price,omitempty"`
-	MaxPrice *float64 `json:"max_price,omitempty"`
+	ChatID   int64    `json:"chat_id" binding:"required"`
+	Action   string   `json:"action"  binding:"required"`
+	MinPrice *float64 `json:"min_price"`
+	MaxPrice *float64 `json:"max_price"`
 }
 
-func (h *Handler) patchSubscription(w http.ResponseWriter, r *http.Request) {
-	subID := r.PathValue("id")
+func (h *Handler) patchSubscription(c *gin.Context) {
+	subID := c.Param("id")
 
 	var req patchSubscriptionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-	if req.ChatID == 0 {
-		writeError(w, http.StatusBadRequest, "chat_id is required")
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "chat_id and action are required"})
 		return
 	}
 
-	userID, err := h.store.UpsertUser(r.Context(), req.ChatID)
+	ctx := c.Request.Context()
+
+	userID, err := h.store.UpsertUser(ctx, req.ChatID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal error")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
 
-	sub, err := h.store.GetSubscription(r.Context(), subID, userID)
+	sub, err := h.store.GetSubscription(ctx, subID, userID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "subscription not found")
+		c.JSON(http.StatusNotFound, gin.H{"error": "subscription not found"})
 		return
 	}
 
 	var trackAction string
 	switch req.Action {
 	case "pause":
-		if err := h.store.PauseSubscription(r.Context(), subID, userID); err != nil {
-			writeError(w, http.StatusInternalServerError, "internal error")
+		if err := h.store.PauseSubscription(ctx, subID, userID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 			return
 		}
 		trackAction = "pause"
 	case "resume":
-		if err := h.store.ResumeSubscription(r.Context(), subID, userID); err != nil {
-			writeError(w, http.StatusInternalServerError, "internal error")
+		if err := h.store.ResumeSubscription(ctx, subID, userID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 			return
 		}
 		trackAction = "resume"
 	case "edit":
 		if req.MinPrice == nil || req.MaxPrice == nil {
-			writeError(w, http.StatusBadRequest, "min_price and max_price are required for edit")
+			c.JSON(http.StatusBadRequest, gin.H{"error": "min_price and max_price are required for edit"})
 			return
 		}
 		if *req.MaxPrice <= *req.MinPrice {
-			writeError(w, http.StatusBadRequest, "max_price must be greater than min_price")
+			c.JSON(http.StatusBadRequest, gin.H{"error": "max_price must be greater than min_price"})
 			return
 		}
-		if err := h.store.UpdateThresholds(r.Context(), subID, userID, *req.MinPrice, *req.MaxPrice); err != nil {
-			writeError(w, http.StatusInternalServerError, "internal error")
+		if err := h.store.UpdateThresholds(ctx, subID, userID, *req.MinPrice, *req.MaxPrice); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 			return
 		}
 	default:
-		writeError(w, http.StatusBadRequest, "action must be pause, resume, or edit")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "action must be pause, resume, or edit"})
 		return
 	}
 
 	if trackAction != "" {
 		plat, _ := platform.Detect(sub.ProductURL)
-		track := contracts.TrackRequest{
+		if err := h.mq.Publish(ctx, broker.QueueTrackRequests, contracts.TrackRequest{
 			Action:    trackAction,
 			ProductID: sub.ProductID,
 			URL:       sub.ProductURL,
 			Platform:  plat,
-		}
-		if err := h.mq.Publish(r.Context(), broker.QueueTrackRequests, track); err != nil {
+		}); err != nil {
 			slog.Error("publish track request", "action", trackAction, "error", err)
 		}
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	c.Status(http.StatusNoContent)
 }
 
-// ─── DELETE /subscriptions/{id} ───────────────────────────────────────────────
+// ─── DELETE /subscriptions/:id ────────────────────────────────────────────────
 
-type chatIDRequest struct {
-	ChatID int64 `json:"chat_id"`
+type chatIDBody struct {
+	ChatID int64 `json:"chat_id" binding:"required"`
 }
 
-func (h *Handler) deleteSubscription(w http.ResponseWriter, r *http.Request) {
-	subID := r.PathValue("id")
+func (h *Handler) deleteSubscription(c *gin.Context) {
+	subID := c.Param("id")
 
-	var req chatIDRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
+	var req chatIDBody
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "chat_id is required"})
 		return
 	}
 
-	userID, err := h.store.UpsertUser(r.Context(), req.ChatID)
+	ctx := c.Request.Context()
+
+	userID, err := h.store.UpsertUser(ctx, req.ChatID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal error")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
 
-	sub, err := h.store.GetSubscription(r.Context(), subID, userID)
+	sub, err := h.store.GetSubscription(ctx, subID, userID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "subscription not found")
+		c.JSON(http.StatusNotFound, gin.H{"error": "subscription not found"})
 		return
 	}
 
-	if err := h.store.DeleteSubscription(r.Context(), subID, userID); err != nil {
+	if err := h.store.DeleteSubscription(ctx, subID, userID); err != nil {
 		slog.Error("delete subscription", "error", err)
-		writeError(w, http.StatusInternalServerError, "internal error")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
 
 	plat, _ := platform.Detect(sub.ProductURL)
-	track := contracts.TrackRequest{
+	if err := h.mq.Publish(ctx, broker.QueueTrackRequests, contracts.TrackRequest{
 		Action:    "delete",
 		ProductID: sub.ProductID,
 		URL:       sub.ProductURL,
 		Platform:  plat,
-	}
-	if err := h.mq.Publish(r.Context(), broker.QueueTrackRequests, track); err != nil {
+	}); err != nil {
 		slog.Error("publish track delete", "error", err)
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	c.Status(http.StatusNoContent)
 }
 
-// ─── GET /subscriptions/{id}/history ─────────────────────────────────────────
+// ─── GET /subscriptions/:id/history ──────────────────────────────────────────
 
-func (h *Handler) getHistory(w http.ResponseWriter, r *http.Request) {
-	subID := r.PathValue("id")
+func (h *Handler) getHistory(c *gin.Context) {
+	subID := c.Param("id")
 
-	chatID, err := parseChatID(r.URL.Query().Get("chat_id"))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid chat_id")
+	chatID, err := strconv.ParseInt(c.Query("chat_id"), 10, 64)
+	if err != nil || chatID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid chat_id"})
 		return
 	}
 
-	userID, err := h.store.UpsertUser(r.Context(), chatID)
+	ctx := c.Request.Context()
+
+	userID, err := h.store.UpsertUser(ctx, chatID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal error")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
 
-	sub, err := h.store.GetSubscription(r.Context(), subID, userID)
+	sub, err := h.store.GetSubscription(ctx, subID, userID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "subscription not found")
+		c.JSON(http.StatusNotFound, gin.H{"error": "subscription not found"})
 		return
 	}
 
-	points, err := h.store.PriceHistory(r.Context(), sub.ProductID, 50)
+	points, err := h.store.PriceHistory(ctx, sub.ProductID, 50)
 	if err != nil {
 		slog.Error("price history", "error", err)
-		writeError(w, http.StatusInternalServerError, "internal error")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
 
 	if points == nil {
 		points = []store.PricePoint{}
 	}
-	writeJSON(w, http.StatusOK, points)
+	c.JSON(http.StatusOK, points)
 }
 
-// ─── POST /subscriptions/{id}/check ──────────────────────────────────────────
+// ─── POST /subscriptions/:id/check ───────────────────────────────────────────
 
-func (h *Handler) postCheck(w http.ResponseWriter, r *http.Request) {
-	subID := r.PathValue("id")
+func (h *Handler) postCheck(c *gin.Context) {
+	subID := c.Param("id")
 
-	var req chatIDRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
+	var req chatIDBody
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "chat_id is required"})
 		return
 	}
 
-	userID, err := h.store.UpsertUser(r.Context(), req.ChatID)
+	ctx := c.Request.Context()
+
+	userID, err := h.store.UpsertUser(ctx, req.ChatID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal error")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
 
-	sub, err := h.store.GetSubscription(r.Context(), subID, userID)
+	sub, err := h.store.GetSubscription(ctx, subID, userID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "subscription not found")
+		c.JSON(http.StatusNotFound, gin.H{"error": "subscription not found"})
 		return
 	}
 
 	plat, _ := platform.Detect(sub.ProductURL)
-	track := contracts.TrackRequest{
+	if err := h.mq.Publish(ctx, broker.QueueTrackRequests, contracts.TrackRequest{
 		Action:    "force",
 		ProductID: sub.ProductID,
 		URL:       sub.ProductURL,
 		Platform:  plat,
-	}
-	if err := h.mq.Publish(r.Context(), broker.QueueTrackRequests, track); err != nil {
+	}); err != nil {
 		slog.Error("publish force check", "error", err)
-		writeError(w, http.StatusInternalServerError, "internal error")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
 
-	writeJSON(w, http.StatusAccepted, map[string]string{"status": "scheduled"})
+	c.JSON(http.StatusAccepted, gin.H{"status": "scheduled"})
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── helpers ─────────────────────────────────────────────────────────────────
 
 func normalizeURL(plat, rawURL string) (string, error) {
 	if plat == "wb" {
@@ -432,21 +445,16 @@ func normalizeURL(plat, rawURL string) (string, error) {
 	return "", fmt.Errorf("unsupported platform: %s", plat)
 }
 
-func parseChatID(s string) (int64, error) {
-	if s == "" {
-		return 0, errors.New("empty chat_id")
+// RequestLogger logs every request via slog.
+func RequestLogger() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		c.Next()
+		slog.Info("http",
+			"method", c.Request.Method,
+			"path", c.Request.URL.Path,
+			"status", c.Writer.Status(),
+			"ms", time.Since(start).Milliseconds(),
+		)
 	}
-	return strconv.ParseInt(s, 10, 64)
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		slog.Error("write json response", "error", err)
-	}
-}
-
-func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
 }

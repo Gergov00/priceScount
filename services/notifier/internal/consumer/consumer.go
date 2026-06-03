@@ -11,21 +11,30 @@ import (
 
 	"github.com/Gergov00/pricescount/shared/pkg/broker"
 	"github.com/Gergov00/pricescount/shared/pkg/contracts"
-	"github.com/Gergov00/pricescount/services/notifier/internal/alert"
 )
+
+// Sender is the notification interface required by Consumer.
+type Sender interface {
+	Send(chatID int64, text string) error
+}
+
+// MQ is the messaging interface required by Consumer.
+type MQ interface {
+	Consume(queue, consumer string) (<-chan amqp.Delivery, error)
+}
 
 // Consumer reads notify.tasks and delivers messages by channel.
 type Consumer struct {
-	conn          *broker.Connection
-	telegramToken string
+	mq     MQ
+	sender Sender
 }
 
-func New(conn *broker.Connection, telegramToken string) *Consumer {
-	return &Consumer{conn: conn, telegramToken: telegramToken}
+func New(mq MQ, sender Sender) *Consumer {
+	return &Consumer{mq: mq, sender: sender}
 }
 
 func (c *Consumer) Run(ctx context.Context) error {
-	deliveries, err := c.conn.Consume(broker.QueueNotifyTasks, "notifier-consumer")
+	deliveries, err := c.mq.Consume(broker.QueueNotifyTasks, "notifier-consumer")
 	if err != nil {
 		return fmt.Errorf("consume %s: %w", broker.QueueNotifyTasks, err)
 	}
@@ -39,12 +48,12 @@ func (c *Consumer) Run(ctx context.Context) error {
 			if !ok {
 				return fmt.Errorf("delivery channel closed unexpectedly")
 			}
-			c.handle(ctx, d)
+			c.handle(d)
 		}
 	}
 }
 
-func (c *Consumer) handle(_ context.Context, d amqp.Delivery) {
+func (c *Consumer) handle(d amqp.Delivery) {
 	var task contracts.NotifyTask
 	if err := json.Unmarshal(d.Body, &task); err != nil {
 		slog.Error("malformed notify task, dropping", "error", err)
@@ -68,7 +77,7 @@ func (c *Consumer) sendTelegram(task contracts.NotifyTask) {
 		slog.Error("invalid telegram target", "target", task.Target, "error", err)
 		return
 	}
-	if err := alert.SendWithRetry(c.telegramToken, chatID, task.Text); err != nil {
+	if err := c.sender.Send(chatID, task.Text); err != nil {
 		slog.Error("telegram send failed", "chat_id", chatID, "error", err)
 	}
 }

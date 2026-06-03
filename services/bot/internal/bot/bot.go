@@ -13,13 +13,35 @@ import (
 	"github.com/Gergov00/pricescount/services/bot/internal/state"
 )
 
-type Bot struct {
-	api   *tgbotapi.BotAPI
-	gw    *gateway.Client
-	state *state.Store
+// Gateway is the minimal API client interface required by Bot.
+// Defined here, in the consumer, per Go convention.
+type Gateway interface {
+	StartLookup(ctx context.Context, rawURL string) (string, error)
+	PollLookup(ctx context.Context, lookupID string) (*gateway.LookupResult, error)
+	CreateSubscription(ctx context.Context, req gateway.CreateSubscriptionRequest) (*gateway.CreateSubscriptionResponse, error)
+	ListSubscriptions(ctx context.Context, chatID int64) ([]gateway.Subscription, error)
+	PauseSubscription(ctx context.Context, chatID int64, subID string) error
+	ResumeSubscription(ctx context.Context, chatID int64, subID string) error
+	EditSubscription(ctx context.Context, chatID int64, subID string, minPrice, maxPrice float64) error
+	DeleteSubscription(ctx context.Context, chatID int64, subID string) error
+	ForceCheck(ctx context.Context, chatID int64, subID string) error
+	GetHistory(ctx context.Context, chatID int64, subID string) ([]gateway.PricePoint, error)
 }
 
-func New(token string, st *state.Store, gw *gateway.Client) (*Bot, error) {
+// SessionStore is the session storage interface required by Bot.
+type SessionStore interface {
+	Get(chatID int64) *state.Session
+	Set(chatID int64, sess *state.Session)
+	Clear(chatID int64)
+}
+
+type Bot struct {
+	api   *tgbotapi.BotAPI
+	gw    Gateway
+	state SessionStore
+}
+
+func New(token string, st SessionStore, gw Gateway) (*Bot, error) {
 	api, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		return nil, fmt.Errorf("bot api: %w", err)

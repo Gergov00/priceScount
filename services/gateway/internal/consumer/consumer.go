@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
@@ -14,21 +15,36 @@ import (
 	"github.com/Gergov00/pricescount/services/gateway/internal/store"
 )
 
+// Store is the persistence interface required by Consumer.
+// Defined here, in the consumer, per Go convention.
+type Store interface {
+	FailLookup(ctx context.Context, lookupID, errMsg string) error
+	CompleteLookup(ctx context.Context, lookupID, name string, price float64) error
+	SavePrice(ctx context.Context, productID string, price float64, currency string, scrapedAt time.Time) error
+	ActiveSubscriptions(ctx context.Context, productID string) ([]store.TriggeredSub, error)
+	TriggeredSubscriptions(ctx context.Context, productID string, price float64) ([]store.TriggeredSub, error)
+}
+
+// MQ is the messaging interface required by Consumer.
+type MQ interface {
+	Consume(queue, consumer string) (<-chan amqp.Delivery, error)
+	Publish(ctx context.Context, queue string, v any) error
+}
+
 // Consumer reads price.results and either:
 //   - completes a pending lookup_request (if LookupID is set), or
 //   - saves price history and fires threshold alerts (if ProductID is set).
 type Consumer struct {
-	conn  *broker.Connection
-	store *store.Store
-	mq    *broker.Connection
+	mq    MQ
+	store Store
 }
 
-func New(conn *broker.Connection, st *store.Store) *Consumer {
-	return &Consumer{conn: conn, store: st, mq: conn}
+func New(mq MQ, st Store) *Consumer {
+	return &Consumer{mq: mq, store: st}
 }
 
 func (c *Consumer) Run(ctx context.Context) error {
-	deliveries, err := c.conn.Consume(broker.QueuePriceResults, "gateway-consumer")
+	deliveries, err := c.mq.Consume(broker.QueuePriceResults, "gateway-consumer")
 	if err != nil {
 		return fmt.Errorf("consume %s: %w", broker.QueuePriceResults, err)
 	}

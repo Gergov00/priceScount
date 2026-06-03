@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
-	"os/signal"
-	"syscall"
+
+	"go.uber.org/fx"
+	"go.uber.org/fx/fxevent"
 
 	"github.com/Gergov00/pricescount/shared/pkg/broker"
 	"github.com/Gergov00/pricescount/shared/pkg/marketplace"
@@ -16,49 +18,69 @@ import (
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
-	cfg, err := config.Load()
-	if err != nil {
-		slog.Error("config", "error", err)
-		os.Exit(1)
-	}
+	fx.New(
+		fx.WithLogger(func() fxevent.Logger { return fxevent.NopLogger }),
+		fx.Provide(
+			config.Load,
+			newBroker,
+			newWBClient,
+			newConsumer,
+		),
+		fx.Invoke(runConsumer),
+	).Run()
+}
 
+func newBroker(lc fx.Lifecycle, cfg *config.Config) (*broker.Connection, error) {
 	conn, err := broker.ConnectWithRetry(cfg.RabbitMQURL, 10)
 	if err != nil {
-		slog.Error("rabbitmq connect", "error", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("rabbitmq: %w", err)
 	}
-	defer conn.Close()
-
 	for _, q := range []string{
 		broker.QueueLookupTasks,
 		broker.QueueScraperTasks,
 		broker.QueuePriceResults,
 	} {
 		if err := conn.DeclareQueue(q); err != nil {
-			slog.Error("declare queue", "queue", q, "error", err)
-			os.Exit(1)
+			conn.Close()
+			return nil, fmt.Errorf("declare queue %s: %w", q, err)
 		}
 	}
+	lc.Append(fx.Hook{OnStop: func(_ context.Context) error {
+		conn.Close()
+		return nil
+	}})
+	return conn, nil
+}
 
-	wbClient := marketplace.NewWBClient()
-	defer wbClient.Close()
+func newWBClient(lc fx.Lifecycle) *marketplace.WBClient {
+	wb := marketplace.NewWBClient()
+	lc.Append(fx.Hook{OnStop: func(_ context.Context) error {
+		wb.Close()
+		return nil
+	}})
+	return wb
+}
 
-	c := consumer.New(conn, wbClient)
+func newConsumer(mq *broker.Connection, wb *marketplace.WBClient) *consumer.Consumer {
+	return consumer.New(mq, wb)
+}
 
+func runConsumer(lc fx.Lifecycle, c *consumer.Consumer, s fx.Shutdowner) {
 	ctx, cancel := context.WithCancel(context.Background())
-
-	go func() {
-		if err := c.Run(ctx); err != nil {
-			slog.Error("consumer error", "error", err)
-		}
-	}()
-
-	slog.Info("extractor service started")
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-
-	cancel()
-	slog.Info("extractor service stopped")
+	lc.Append(fx.Hook{
+		OnStart: func(_ context.Context) error {
+			slog.Info("extractor service started")
+			go func() {
+				if err := c.Run(ctx); err != nil {
+					slog.Error("consumer stopped", "error", err)
+					s.Shutdown(fx.ExitCode(1))
+				}
+			}()
+			return nil
+		},
+		OnStop: func(_ context.Context) error {
+			cancel()
+			return nil
+		},
+	})
 }

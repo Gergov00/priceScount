@@ -284,6 +284,40 @@ func (s *Store) PriceHistory(ctx context.Context, productID string, limit int) (
 	return points, rows.Err()
 }
 
+// ─── Scheduler resync ────────────────────────────────────────────────────────
+
+// ActiveProduct is a distinct product that has at least one active non-paused subscription.
+type ActiveProduct struct {
+	ProductID string
+	URL       string
+	Platform  string
+}
+
+// AllActiveProducts returns one entry per product that has at least one active,
+// non-paused subscription. Used on gateway startup to resync the scheduler.
+func (s *Store) AllActiveProducts(ctx context.Context) ([]ActiveProduct, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT DISTINCT p.id, p.url, p.platform
+		 FROM subscriptions s
+		 JOIN products p ON p.id = s.product_id
+		 WHERE s.active = true AND s.paused = false`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("all active products: %w", err)
+	}
+	defer rows.Close()
+
+	var products []ActiveProduct
+	for rows.Next() {
+		var p ActiveProduct
+		if err := rows.Scan(&p.ProductID, &p.URL, &p.Platform); err != nil {
+			return nil, fmt.Errorf("scan active product: %w", err)
+		}
+		products = append(products, p)
+	}
+	return products, rows.Err()
+}
+
 // ─── Threshold checking ───────────────────────────────────────────────────────
 
 type TriggeredSub struct {

@@ -15,6 +15,9 @@ func Load() (*Config, error) {
 		RabbitMQURL:   getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
 		TelegramToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
 	}
+	if c.RabbitMQURL == "" {
+		return nil, fmt.Errorf("RABBITMQ_URL is required")
+	}
 	if c.TelegramToken == "" {
 		return nil, fmt.Errorf("TELEGRAM_BOT_TOKEN is required")
 	}

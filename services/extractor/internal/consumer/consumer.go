@@ -15,21 +15,27 @@ import (
 	"github.com/Gergov00/pricescount/shared/pkg/marketplace"
 )
 
+// Fetcher is the scraping interface required by Consumer.
+type Fetcher interface {
+	FetchProduct(ctx context.Context, url string) (*marketplace.Product, error)
+}
+
+// MQ is the messaging interface required by Consumer.
+type MQ interface {
+	ConsumeWithPrefetch(queue, consumer string, prefetch int) (<-chan amqp.Delivery, error)
+	Publish(ctx context.Context, queue string, v any) error
+}
+
 // Consumer runs two goroutines consuming from separate queues:
 //   - lookup.tasks  (prefetch=1): one-time product fetches from Gateway
 //   - scraper.tasks (prefetch=2): periodic monitoring from Scheduler
 type Consumer struct {
-	conn *broker.Connection
-	wb   *marketplace.WBClient
-	pub  *publisher
+	mq MQ
+	wb Fetcher
 }
 
-func New(conn *broker.Connection, wb *marketplace.WBClient) *Consumer {
-	return &Consumer{
-		conn: conn,
-		wb:   wb,
-		pub:  &publisher{conn: conn},
-	}
+func New(mq MQ, wb Fetcher) *Consumer {
+	return &Consumer{mq: mq, wb: wb}
 }
 
 // Run starts both consumer goroutines and blocks until ctx is cancelled or either fails.
@@ -65,7 +71,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 }
 
 func (c *Consumer) runQueue(ctx context.Context, queue, consumerTag string, prefetch int) error {
-	deliveries, err := c.conn.ConsumeWithPrefetch(queue, consumerTag, prefetch)
+	deliveries, err := c.mq.ConsumeWithPrefetch(queue, consumerTag, prefetch)
 	if err != nil {
 		return fmt.Errorf("consume %s: %w", queue, err)
 	}
@@ -105,9 +111,9 @@ func (c *Consumer) handleLookup(ctx context.Context, d amqp.Delivery) {
 
 	product, err := c.fetch(ctx, task.Platform, task.URL)
 	result := contracts.PriceResult{
-		TaskID:   task.TaskID,
-		LookupID: task.LookupID,
-		URL:      task.URL,
+		TaskID:    task.TaskID,
+		LookupID:  task.LookupID,
+		URL:       task.URL,
 		ScrapedAt: time.Now().UTC(),
 	}
 	if err != nil {
@@ -122,7 +128,7 @@ func (c *Consumer) handleLookup(ctx context.Context, d amqp.Delivery) {
 		log.Info("lookup fetch completed", "name", product.Name, "price", product.Price)
 	}
 
-	if err := c.pub.publish(ctx, result); err != nil {
+	if err := c.mq.Publish(ctx, broker.QueuePriceResults, result); err != nil {
 		log.Error("publish lookup result failed, requeuing", "error", err)
 		d.Nack(false, true)
 		return
@@ -159,7 +165,7 @@ func (c *Consumer) handleScraper(ctx context.Context, d amqp.Delivery) {
 		log.Info("scraper fetch completed", "price", product.Price)
 	}
 
-	if err := c.pub.publish(ctx, result); err != nil {
+	if err := c.mq.Publish(ctx, broker.QueuePriceResults, result); err != nil {
 		log.Error("publish scraper result failed, requeuing", "error", err)
 		d.Nack(false, true)
 		return
@@ -174,13 +180,4 @@ func (c *Consumer) fetch(ctx context.Context, plat, url string) (*marketplace.Pr
 	default:
 		return nil, fmt.Errorf("unknown platform: %s", plat)
 	}
-}
-
-// publisher wraps the broker connection for publishing price results.
-type publisher struct {
-	conn *broker.Connection
-}
-
-func (p *publisher) publish(ctx context.Context, result contracts.PriceResult) error {
-	return p.conn.Publish(ctx, broker.QueuePriceResults, result)
 }

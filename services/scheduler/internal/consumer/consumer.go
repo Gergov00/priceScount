@@ -12,21 +12,35 @@ import (
 
 	"github.com/Gergov00/pricescount/shared/pkg/broker"
 	"github.com/Gergov00/pricescount/shared/pkg/contracts"
-	"github.com/Gergov00/pricescount/services/scheduler/internal/store"
 )
+
+// Store is the persistence interface required by Consumer.
+type Store interface {
+	Add(ctx context.Context, productID, url, platform string, intervalHours int) error
+	SetActive(ctx context.Context, url string, active bool) error
+	SetNextCheck(ctx context.Context, url string) error
+	Delete(ctx context.Context, url string) error
+	AdvanceNextCheck(ctx context.Context, url string) error
+}
+
+// MQ is the messaging interface required by Consumer.
+type MQ interface {
+	Consume(queue, consumer string) (<-chan amqp.Delivery, error)
+	Publish(ctx context.Context, queue string, v any) error
+}
 
 // Consumer reads track.requests and updates the scheduled_urls table accordingly.
 type Consumer struct {
-	conn  *broker.Connection
-	store *store.Store
+	mq    MQ
+	store Store
 }
 
-func New(conn *broker.Connection, st *store.Store) *Consumer {
-	return &Consumer{conn: conn, store: st}
+func New(mq MQ, st Store) *Consumer {
+	return &Consumer{mq: mq, store: st}
 }
 
 func (c *Consumer) Run(ctx context.Context) error {
-	deliveries, err := c.conn.Consume(broker.QueueTrackRequests, "scheduler-consumer")
+	deliveries, err := c.mq.Consume(broker.QueueTrackRequests, "scheduler-consumer")
 	if err != nil {
 		return fmt.Errorf("consume %s: %w", broker.QueueTrackRequests, err)
 	}
@@ -98,7 +112,7 @@ func (c *Consumer) handleForce(ctx context.Context, req contracts.TrackRequest) 
 		ScheduledAt: time.Now().UTC(),
 		Force:       true,
 	}
-	if err := c.conn.Publish(ctx, broker.QueueScraperTasks, task); err != nil {
+	if err := c.mq.Publish(ctx, broker.QueueScraperTasks, task); err != nil {
 		return fmt.Errorf("publish force scraper task: %w", err)
 	}
 	return c.store.AdvanceNextCheck(ctx, req.URL)

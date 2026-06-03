@@ -12,15 +12,25 @@ import (
 	"github.com/Gergov00/pricescount/services/scheduler/internal/store"
 )
 
+// Store is the persistence interface required by Scheduler.
+type Store interface {
+	DueURLs(ctx context.Context, interval time.Duration) ([]store.URLEntry, error)
+}
+
+// Publisher is the messaging interface required by Scheduler.
+type Publisher interface {
+	Publish(ctx context.Context, queue string, v any) error
+}
+
 // Scheduler periodically picks URLs due for re-checking and publishes scraper tasks.
 type Scheduler struct {
-	conn     *broker.Connection
-	store    *store.Store
+	pub      Publisher
+	store    Store
 	interval time.Duration
 }
 
-func New(conn *broker.Connection, st *store.Store, interval time.Duration) *Scheduler {
-	return &Scheduler{conn: conn, store: st, interval: interval}
+func New(pub Publisher, st Store, interval time.Duration) *Scheduler {
+	return &Scheduler{pub: pub, store: st, interval: interval}
 }
 
 // Run starts the tick loop. Dispatches immediately on start, then every interval.
@@ -63,7 +73,7 @@ func (s *Scheduler) dispatch(ctx context.Context) {
 			Platform:    entry.Platform,
 			ScheduledAt: time.Now().UTC(),
 		}
-		if err := s.conn.Publish(ctx, broker.QueueScraperTasks, task); err != nil {
+		if err := s.pub.Publish(ctx, broker.QueueScraperTasks, task); err != nil {
 			slog.Error("publish scraper task failed", "url", entry.URL, "error", err)
 			continue
 		}

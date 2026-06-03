@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
-	"os/signal"
-	"syscall"
+
+	"go.uber.org/fx"
+	"go.uber.org/fx/fxevent"
 
 	"github.com/Gergov00/pricescount/shared/pkg/broker"
+	"github.com/Gergov00/pricescount/services/notifier/internal/alert"
 	"github.com/Gergov00/pricescount/services/notifier/internal/config"
 	"github.com/Gergov00/pricescount/services/notifier/internal/consumer"
 )
@@ -15,41 +18,58 @@ import (
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
-	cfg, err := config.Load()
-	if err != nil {
-		slog.Error("config", "error", err)
-		os.Exit(1)
-	}
+	fx.New(
+		fx.WithLogger(func() fxevent.Logger { return fxevent.NopLogger }),
+		fx.Provide(
+			config.Load,
+			newBroker,
+			newTelegramSender,
+			newConsumer,
+		),
+		fx.Invoke(runConsumer),
+	).Run()
+}
 
+func newBroker(lc fx.Lifecycle, cfg *config.Config) (*broker.Connection, error) {
 	conn, err := broker.ConnectWithRetry(cfg.RabbitMQURL, 10)
 	if err != nil {
-		slog.Error("rabbitmq connect", "error", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("rabbitmq: %w", err)
 	}
-	defer conn.Close()
-
 	if err := conn.DeclareQueue(broker.QueueNotifyTasks); err != nil {
-		slog.Error("declare queue", "queue", broker.QueueNotifyTasks, "error", err)
-		os.Exit(1)
+		conn.Close()
+		return nil, fmt.Errorf("declare queue: %w", err)
 	}
+	lc.Append(fx.Hook{OnStop: func(_ context.Context) error {
+		conn.Close()
+		return nil
+	}})
+	return conn, nil
+}
 
+func newTelegramSender(cfg *config.Config) *alert.TelegramSender {
+	return alert.NewTelegramSender(cfg.TelegramToken)
+}
+
+func newConsumer(mq *broker.Connection, sender *alert.TelegramSender) *consumer.Consumer {
+	return consumer.New(mq, sender)
+}
+
+func runConsumer(lc fx.Lifecycle, c *consumer.Consumer, s fx.Shutdowner) {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	c := consumer.New(conn, cfg.TelegramToken)
-
-	go func() {
-		if err := c.Run(ctx); err != nil {
-			slog.Error("consumer error", "error", err)
-		}
-	}()
-
-	slog.Info("notifier service started")
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-
-	cancel()
-	slog.Info("notifier service stopped")
+	lc.Append(fx.Hook{
+		OnStart: func(_ context.Context) error {
+			slog.Info("notifier service started")
+			go func() {
+				if err := c.Run(ctx); err != nil {
+					slog.Error("consumer stopped", "error", err)
+					s.Shutdown(fx.ExitCode(1))
+				}
+			}()
+			return nil
+		},
+		OnStop: func(_ context.Context) error {
+			cancel()
+			return nil
+		},
+	})
 }

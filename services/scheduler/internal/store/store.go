@@ -22,12 +22,15 @@ func New(db *pgxpool.Pool) *Store {
 	return &Store{db: db}
 }
 
-// Add inserts a URL into scheduled_urls. Does nothing if the URL already exists (UNIQUE constraint).
+// Add inserts or reactivates a URL in scheduled_urls. On conflict it reactivates the entry
+// and resets next_check_at to NOW() so the scheduler picks it up on the next tick.
 func (s *Store) Add(ctx context.Context, productID, url, platform string, intervalHours int) error {
 	_, err := s.db.Exec(ctx,
 		`INSERT INTO scheduled_urls(product_id, url, platform, next_check_at, check_interval_hours)
 		 VALUES($1, $2, $3, NOW(), $4)
-		 ON CONFLICT(url) DO NOTHING`,
+		 ON CONFLICT(url) DO UPDATE SET
+		     active = true,
+		     next_check_at = NOW()`,
 		productID, url, platform, intervalHours,
 	)
 	if err != nil {

@@ -4,12 +4,15 @@ import (
 	"context"
 	"log/slog"
 	"time"
-
-	"github.com/Gergov00/pricescount/services/gateway/internal/store"
 )
 
+// Store is the persistence interface required by the TTL cleaner.
+type Store interface {
+	DeleteExpiredLookups(ctx context.Context) (int64, error)
+}
+
 // Run deletes expired lookup_requests every interval until ctx is cancelled.
-func Run(ctx context.Context, st *store.Store, interval time.Duration) {
+func Run(ctx context.Context, st Store, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
