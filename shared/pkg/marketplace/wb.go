@@ -134,11 +134,20 @@ func extractWBName(title, nmID string) string {
 	return ""
 }
 
+// parseWBPrice extracts the first price from the element text. The element may
+// contain both the discounted and the old price (e.g. "5 690 ₽\n7 000 ₽"), so
+// parsing stops at the first currency sign or line break after digits started.
 func parseWBPrice(s string) float64 {
 	var digits strings.Builder
 	for _, r := range s {
-		if r >= '0' && r <= '9' {
+		switch {
+		case r >= '0' && r <= '9':
 			digits.WriteRune(r)
+		case r == ' ' || r == '\u00a0': // spaces are thousand separators, keep scanning
+		case digits.Len() > 0:
+			// first non-digit, non-space after the number — stop ("₽", "\n", etc.)
+			f, _ := strconv.ParseFloat(digits.String(), 64)
+			return f
 		}
 	}
 	if digits.Len() == 0 {

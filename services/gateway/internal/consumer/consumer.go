@@ -21,8 +21,8 @@ type Store interface {
 	FailLookup(ctx context.Context, lookupID, errMsg string) error
 	CompleteLookup(ctx context.Context, lookupID, name string, price float64) error
 	SavePrice(ctx context.Context, productID string, price float64, currency string, scrapedAt time.Time) error
-	ActiveSubscriptions(ctx context.Context, productID string) ([]store.TriggeredSub, error)
-	TriggeredSubscriptions(ctx context.Context, productID string, price float64) ([]store.TriggeredSub, error)
+	ProductSubscriptions(ctx context.Context, productID string) ([]store.ProductSub, error)
+	SetAlertState(ctx context.Context, subID, alertState string) error
 }
 
 // MQ is the messaging interface required by Consumer.
@@ -114,49 +114,69 @@ func (c *Consumer) handleMonitoring(ctx context.Context, d amqp.Delivery, result
 		return
 	}
 
-	var subs []store.TriggeredSub
-	var err error
-	if result.Force {
-		subs, err = c.store.ActiveSubscriptions(ctx, result.ProductID)
-	} else {
-		subs, err = c.store.TriggeredSubscriptions(ctx, result.ProductID, result.Price)
-	}
+	subs, err := c.store.ProductSubscriptions(ctx, result.ProductID)
 	if err != nil {
-		log.Error("subscriptions query failed", "product_id", result.ProductID, "error", err)
-		d.Ack(false)
+		log.Error("subscriptions query failed, requeuing", "product_id", result.ProductID, "error", err)
+		d.Nack(false, true)
 		return
 	}
 
+	alerts := 0
 	for _, sub := range subs {
-		var text string
 		if result.Force {
-			text = formatStatus(sub.ProductName, sub.ProductURL, result.Price, result.Currency, sub.MinPrice, sub.MaxPrice)
-		} else {
-			direction := "down"
-			if result.Price > sub.MaxPrice {
-				direction = "up"
+			// Force-check status goes only to the chat that requested it.
+			if result.ChatID != 0 && sub.ChatID != result.ChatID {
+				continue
 			}
-			text = formatAlert(sub.ProductName, sub.ProductURL, result.Price, result.Currency, direction, sub.MinPrice, sub.MaxPrice)
+			c.notify(ctx, log, sub.ChatID, "", formatStatus(
+				sub.ProductName, sub.ProductURL, result.Price, result.Currency, sub.MinPrice, sub.MaxPrice))
+			alerts++
+			continue
 		}
-		task := contracts.NotifyTask{
-			Channel: "telegram",
-			Target:  strconv.FormatInt(sub.ChatID, 10),
-			Text:    text,
+
+		newState := alertState(result.Price, sub.MinPrice, sub.MaxPrice)
+		if newState == sub.AlertState {
+			continue // price still in the same zone — already alerted (or still in range)
 		}
-		if !result.Force {
-			if result.Price < sub.MinPrice {
-				task.Direction = "down"
-			} else {
-				task.Direction = "up"
-			}
+		if err := c.store.SetAlertState(ctx, sub.SubID, newState); err != nil {
+			log.Error("set alert state failed", "sub_id", sub.SubID, "error", err)
+			continue // skip the alert rather than risk re-alert spam on requeue
 		}
-		if err := c.mq.Publish(ctx, broker.QueueNotifyTasks, task); err != nil {
-			log.Error("publish notify task failed", "chat_id", sub.ChatID, "error", err)
+		if newState == "" {
+			continue // price returned into range — reset state, no alert
 		}
+		c.notify(ctx, log, sub.ChatID, newState, formatAlert(
+			sub.ProductName, sub.ProductURL, result.Price, result.Currency, newState, sub.MinPrice, sub.MaxPrice))
+		alerts++
 	}
 
-	log.Info("monitoring result processed", "product_id", result.ProductID, "price", result.Price, "alerts", len(subs), "force", result.Force)
+	log.Info("monitoring result processed", "product_id", result.ProductID, "price", result.Price, "alerts", alerts, "force", result.Force)
 	d.Ack(false)
+}
+
+// alertState classifies the price against the thresholds: "down" below min,
+// "up" above max, "" inside the range. max <= 0 means "no upper bound".
+func alertState(price, minPrice, maxPrice float64) string {
+	switch {
+	case minPrice > 0 && price < minPrice:
+		return "down"
+	case maxPrice > 0 && price > maxPrice:
+		return "up"
+	default:
+		return ""
+	}
+}
+
+func (c *Consumer) notify(ctx context.Context, log *slog.Logger, chatID int64, direction, text string) {
+	task := contracts.NotifyTask{
+		Channel:   "telegram",
+		Target:    strconv.FormatInt(chatID, 10),
+		Text:      text,
+		Direction: direction,
+	}
+	if err := c.mq.Publish(ctx, broker.QueueNotifyTasks, task); err != nil {
+		log.Error("publish notify task failed", "chat_id", chatID, "error", err)
+	}
 }
 
 func formatAlert(name, url string, price float64, currency, direction string, minPrice, maxPrice float64) string {

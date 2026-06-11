@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 
@@ -29,14 +30,16 @@ func main() {
 	).Run()
 }
 
-func newGatewayClient(cfg config.Config) *gateway.Client {
-	return gateway.New(cfg.GatewayURL)
+func newGatewayClient(cfg config.Config) (*gateway.Client, error) {
+	if cfg.InternalToken == "" {
+		return nil, fmt.Errorf("INTERNAL_TOKEN is not set")
+	}
+	return gateway.New(cfg.GatewayURL, cfg.InternalToken), nil
 }
 
 func newBot(cfg config.Config, st *state.Store, gw *gateway.Client) (*bot.Bot, error) {
 	if cfg.TelegramToken == "" {
-		slog.Error("TELEGRAM_BOT_TOKEN is not set")
-		os.Exit(1)
+		return nil, fmt.Errorf("TELEGRAM_BOT_TOKEN is not set")
 	}
 	return bot.New(cfg.TelegramToken, st, gw)
 }

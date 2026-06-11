@@ -71,10 +71,14 @@ func (b *Bot) Run(ctx context.Context) error {
 			b.api.StopReceivingUpdates()
 			return nil
 		case update := <-updates:
+			// Each update is handled in its own goroutine: handlers call the
+			// Gateway and retry Telegram sends with sleeps, and one slow user
+			// must not block the update loop for everyone. Session state is
+			// mutex-protected in state.Store.
 			if update.Message != nil {
-				b.handleMessage(ctx, update.Message)
+				go b.handleMessage(ctx, update.Message)
 			} else if update.CallbackQuery != nil {
-				b.handleCallback(ctx, update.CallbackQuery)
+				go b.handleCallback(ctx, update.CallbackQuery)
 			}
 		}
 	}
@@ -118,8 +122,11 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 }
 
 func (b *Bot) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
-	chatID := cb.Message.Chat.ID
 	b.api.Request(tgbotapi.NewCallback(cb.ID, ""))
+	if cb.Message == nil {
+		return // callback from an inline/expired message — nothing to act on
+	}
+	chatID := cb.Message.Chat.ID
 
 	switch {
 	case strings.HasPrefix(cb.Data, "edit_sub:"):

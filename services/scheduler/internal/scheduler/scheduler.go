@@ -14,7 +14,7 @@ import (
 
 // Store is the persistence interface required by Scheduler.
 type Store interface {
-	DueURLs(ctx context.Context, interval time.Duration) ([]store.URLEntry, error)
+	DueURLs(ctx context.Context) ([]store.URLEntry, error)
 }
 
 // Publisher is the messaging interface required by Scheduler.
@@ -52,7 +52,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 }
 
 func (s *Scheduler) dispatch(ctx context.Context) {
-	due, err := s.store.DueURLs(ctx, s.interval)
+	due, err := s.store.DueURLs(ctx)
 	if err != nil {
 		slog.Error("failed to fetch due URLs", "error", err)
 		return

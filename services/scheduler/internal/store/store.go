@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -22,15 +21,16 @@ func New(db *pgxpool.Pool) *Store {
 	return &Store{db: db}
 }
 
-// Add inserts or reactivates a URL in scheduled_urls. On conflict it reactivates the entry
-// and resets next_check_at to NOW() so the scheduler picks it up on the next tick.
+// Add inserts or reactivates a URL in scheduled_urls. A new URL is checked on
+// the next tick; on conflict the existing schedule is kept so gateway restarts
+// (startup resync publishes add for every product) do not trigger a scrape wave.
 func (s *Store) Add(ctx context.Context, productID, url, platform string, intervalHours int) error {
 	_, err := s.db.Exec(ctx,
 		`INSERT INTO scheduled_urls(product_id, url, platform, next_check_at, check_interval_hours)
 		 VALUES($1, $2, $3, NOW(), $4)
 		 ON CONFLICT(url) DO UPDATE SET
 		     active = true,
-		     next_check_at = NOW()`,
+		     check_interval_hours = EXCLUDED.check_interval_hours`,
 		productID, url, platform, intervalHours,
 	)
 	if err != nil {
@@ -77,18 +77,17 @@ func (s *Store) Delete(ctx context.Context, url string) error {
 
 // DueURLs returns all active URLs whose next_check_at is in the past,
 // locking them with SKIP LOCKED to prevent double-dispatch across replicas.
-// It immediately reschedules them to avoid re-selection on the next tick.
-func (s *Store) DueURLs(ctx context.Context, interval time.Duration) ([]URLEntry, error) {
+// Each URL is rescheduled by its own check_interval_hours.
+func (s *Store) DueURLs(ctx context.Context) ([]URLEntry, error) {
 	rows, err := s.db.Query(ctx,
 		`UPDATE scheduled_urls
-		 SET next_check_at = NOW() + $1::interval
+		 SET next_check_at = NOW() + (check_interval_hours * interval '1 hour')
 		 WHERE id IN (
 		     SELECT id FROM scheduled_urls
 		     WHERE next_check_at <= NOW() AND active = true
 		     FOR UPDATE SKIP LOCKED
 		 )
 		 RETURNING product_id, url, platform`,
-		fmt.Sprintf("%d seconds", int(interval.Seconds())),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("due urls: %w", err)

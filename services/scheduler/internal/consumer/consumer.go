@@ -111,6 +111,7 @@ func (c *Consumer) handleForce(ctx context.Context, req contracts.TrackRequest) 
 		Platform:    req.Platform,
 		ScheduledAt: time.Now().UTC(),
 		Force:       true,
+		ChatID:      req.ChatID,
 	}
 	if err := c.mq.Publish(ctx, broker.QueueScraperTasks, task); err != nil {
 		return fmt.Errorf("publish force scraper task: %w", err)

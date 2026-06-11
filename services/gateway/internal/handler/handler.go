@@ -2,6 +2,8 @@ package handler
 
 import (
 	"context"
+	"crypto/subtle"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -22,12 +24,14 @@ import (
 type Store interface {
 	CreateLookup(ctx context.Context, id, url string) error
 	GetLookup(ctx context.Context, id string) (*store.LookupResult, error)
+	PendingLookupCount(ctx context.Context) (int, error)
 	UpsertUser(ctx context.Context, chatID int64) (string, error)
-	ProductIDByURL(ctx context.Context, url string) (string, error)
-	UpsertProduct(ctx context.Context, id, name, url, platform string) error
+	UserIDByChatID(ctx context.Context, chatID int64) (string, error)
+	EnsureProduct(ctx context.Context, candidateID, name, url, platform string) (string, error)
 	CreateSubscription(ctx context.Context, userID, productID string, minPrice, maxPrice float64) (string, error)
 	UserSubscriptions(ctx context.Context, userID string) ([]store.Subscription, error)
 	GetSubscription(ctx context.Context, subID, userID string) (*store.Subscription, error)
+	ProductSubCounts(ctx context.Context, productID string) (store.SubCounts, error)
 	PauseSubscription(ctx context.Context, subID, userID string) error
 	ResumeSubscription(ctx context.Context, subID, userID string) error
 	UpdateThresholds(ctx context.Context, subID, userID string, minPrice, maxPrice float64) error
@@ -68,10 +72,25 @@ type postLookupRequest struct {
 	URL string `json:"url" binding:"required"`
 }
 
+// maxPendingLookups bounds the lookup queue: each lookup costs a headless-Chrome
+// page load (~10-40s), so an unbounded queue is a trivial DoS vector.
+const maxPendingLookups = 25
+
 func (h *Handler) postLookup(c *gin.Context) {
 	var req postLookupRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "url is required"})
+		return
+	}
+
+	pending, err := h.store.PendingLookupCount(c.Request.Context())
+	if err != nil {
+		slog.Error("pending lookup count", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+	if pending >= maxPendingLookups {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many lookups in progress, try again later"})
 		return
 	}
 
@@ -112,8 +131,13 @@ func (h *Handler) postLookup(c *gin.Context) {
 
 func (h *Handler) getLookup(c *gin.Context) {
 	result, err := h.store.GetLookup(c.Request.Context(), c.Param("id"))
-	if err != nil {
+	if errors.Is(err, store.ErrNotFound) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "lookup not found"})
+		return
+	}
+	if err != nil {
+		slog.Error("get lookup", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
 
@@ -147,8 +171,8 @@ func (h *Handler) postSubscription(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "chat_id and lookup_id are required"})
 		return
 	}
-	if req.MaxPrice <= req.MinPrice {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "max_price must be greater than min_price"})
+	if req.MinPrice < 0 || req.MaxPrice <= req.MinPrice {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "prices must be non-negative and max_price greater than min_price"})
 		return
 	}
 
@@ -169,13 +193,9 @@ func (h *Handler) postSubscription(c *gin.Context) {
 
 	plat, _ := platform.Detect(lookup.URL)
 
-	productID, err := h.store.ProductIDByURL(ctx, lookup.URL)
+	productID, err := h.store.EnsureProduct(ctx, uuid.New().String(), lookup.Name, lookup.URL, plat)
 	if err != nil {
-		productID = uuid.New().String()
-	}
-
-	if err := h.store.UpsertProduct(ctx, productID, lookup.Name, lookup.URL, plat); err != nil {
-		slog.Error("upsert product", "error", err)
+		slog.Error("ensure product", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
@@ -187,6 +207,9 @@ func (h *Handler) postSubscription(c *gin.Context) {
 		return
 	}
 
+	// The subscription is saved, but without this message the scheduler never
+	// monitors it. Surface the failure so the client retries (the create is
+	// an idempotent upsert).
 	if err := h.mq.Publish(ctx, broker.QueueTrackRequests, contracts.TrackRequest{
 		Action:        "add",
 		ProductID:     productID,
@@ -195,6 +218,8 @@ func (h *Handler) postSubscription(c *gin.Context) {
 		IntervalHours: 1,
 	}); err != nil {
 		slog.Error("publish track request", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"subscription_id": subID, "product_id": productID})
@@ -211,9 +236,13 @@ func (h *Handler) listSubscriptions(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	userID, err := h.store.UpsertUser(ctx, chatID)
+	userID, err := h.store.UserIDByChatID(ctx, chatID)
+	if errors.Is(err, store.ErrNotFound) {
+		c.JSON(http.StatusOK, []store.Subscription{})
+		return
+	}
 	if err != nil {
-		slog.Error("upsert user", "chat_id", chatID, "error", err)
+		slog.Error("user by chat_id", "chat_id", chatID, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
@@ -251,9 +280,8 @@ func (h *Handler) patchSubscription(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	userID, err := h.store.UpsertUser(ctx, req.ChatID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+	userID, ok := h.userIDOr404(c, req.ChatID)
+	if !ok {
 		return
 	}
 
@@ -270,7 +298,17 @@ func (h *Handler) patchSubscription(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 			return
 		}
-		trackAction = "pause"
+		// The scheduler entry is shared by everyone tracking this URL —
+		// stop monitoring only when no one is watching anymore.
+		watching, err := h.productStillWatched(ctx, sub.ProductID)
+		if err != nil {
+			slog.Error("product sub counts", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+			return
+		}
+		if !watching {
+			trackAction = "pause"
+		}
 	case "resume":
 		if err := h.store.ResumeSubscription(ctx, subID, userID); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
@@ -282,8 +320,8 @@ func (h *Handler) patchSubscription(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "min_price and max_price are required for edit"})
 			return
 		}
-		if *req.MaxPrice <= *req.MinPrice {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "max_price must be greater than min_price"})
+		if *req.MinPrice < 0 || *req.MaxPrice <= *req.MinPrice {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "prices must be non-negative and max_price greater than min_price"})
 			return
 		}
 		if err := h.store.UpdateThresholds(ctx, subID, userID, *req.MinPrice, *req.MaxPrice); err != nil {
@@ -304,6 +342,8 @@ func (h *Handler) patchSubscription(c *gin.Context) {
 			Platform:  plat,
 		}); err != nil {
 			slog.Error("publish track request", "action", trackAction, "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+			return
 		}
 	}
 
@@ -327,9 +367,8 @@ func (h *Handler) deleteSubscription(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	userID, err := h.store.UpsertUser(ctx, req.ChatID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+	userID, ok := h.userIDOr404(c, req.ChatID)
+	if !ok {
 		return
 	}
 
@@ -345,14 +384,35 @@ func (h *Handler) deleteSubscription(c *gin.Context) {
 		return
 	}
 
-	plat, _ := platform.Detect(sub.ProductURL)
-	if err := h.mq.Publish(ctx, broker.QueueTrackRequests, contracts.TrackRequest{
-		Action:    "delete",
-		ProductID: sub.ProductID,
-		URL:       sub.ProductURL,
-		Platform:  plat,
-	}); err != nil {
-		slog.Error("publish track delete", "error", err)
+	// Other users may still track the same URL — only drop the scheduler
+	// entry when no active subscriptions remain at all, and merely pause it
+	// when the rest are paused.
+	counts, err := h.store.ProductSubCounts(ctx, sub.ProductID)
+	if err != nil {
+		slog.Error("product sub counts", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+	trackAction := ""
+	switch {
+	case counts.Active == 0:
+		trackAction = "delete"
+	case counts.Watching == 0:
+		trackAction = "pause"
+	}
+
+	if trackAction != "" {
+		plat, _ := platform.Detect(sub.ProductURL)
+		if err := h.mq.Publish(ctx, broker.QueueTrackRequests, contracts.TrackRequest{
+			Action:    trackAction,
+			ProductID: sub.ProductID,
+			URL:       sub.ProductURL,
+			Platform:  plat,
+		}); err != nil {
+			slog.Error("publish track request", "action", trackAction, "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+			return
+		}
 	}
 
 	c.Status(http.StatusNoContent)
@@ -371,9 +431,8 @@ func (h *Handler) getHistory(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	userID, err := h.store.UpsertUser(ctx, chatID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+	userID, ok := h.userIDOr404(c, chatID)
+	if !ok {
 		return
 	}
 
@@ -409,9 +468,8 @@ func (h *Handler) postCheck(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	userID, err := h.store.UpsertUser(ctx, req.ChatID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+	userID, ok := h.userIDOr404(c, req.ChatID)
+	if !ok {
 		return
 	}
 
@@ -427,6 +485,7 @@ func (h *Handler) postCheck(c *gin.Context) {
 		ProductID: sub.ProductID,
 		URL:       sub.ProductURL,
 		Platform:  plat,
+		ChatID:    req.ChatID, // only the requester gets the status message
 	}); err != nil {
 		slog.Error("publish force check", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
@@ -438,11 +497,61 @@ func (h *Handler) postCheck(c *gin.Context) {
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
+// userIDOr404 resolves chat_id to an existing user. On failure it writes the
+// response and returns ok=false. A missing user reads as "subscription not
+// found" so chat_id probing cannot distinguish users from subscriptions.
+func (h *Handler) userIDOr404(c *gin.Context, chatID int64) (string, bool) {
+	userID, err := h.store.UserIDByChatID(c.Request.Context(), chatID)
+	if errors.Is(err, store.ErrNotFound) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "subscription not found"})
+		return "", false
+	}
+	if err != nil {
+		slog.Error("user by chat_id", "chat_id", chatID, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return "", false
+	}
+	return userID, true
+}
+
+// productStillWatched reports whether the product has at least one active,
+// non-paused subscription left.
+func (h *Handler) productStillWatched(ctx context.Context, productID string) (bool, error) {
+	counts, err := h.store.ProductSubCounts(ctx, productID)
+	if err != nil {
+		return false, err
+	}
+	return counts.Watching > 0, nil
+}
+
 func normalizeURL(plat, rawURL string) (string, error) {
 	if plat == "wb" {
 		return platform.NormalizeWB(rawURL)
 	}
 	return "", fmt.Errorf("unsupported platform: %s", plat)
+}
+
+// ─── middleware ──────────────────────────────────────────────────────────────
+
+// Auth rejects requests that do not carry the shared internal token in the
+// X-Internal-Token header. The Gateway is an internal API for the Bot only.
+func Auth(token string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		got := c.GetHeader("X-Internal-Token")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+			return
+		}
+		c.Next()
+	}
+}
+
+// BodyLimit caps request body size.
+func BodyLimit(maxBytes int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+		c.Next()
+	}
 }
 
 // RequestLogger logs every request via slog.

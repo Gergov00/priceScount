@@ -17,16 +17,22 @@ CREATE TABLE IF NOT EXISTS products (
 );
 
 CREATE TABLE IF NOT EXISTS subscriptions (
-    id         UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id    UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    product_id UUID         NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-    min_price  NUMERIC(12,2),
-    max_price  NUMERIC(12,2),
-    paused     BOOLEAN      NOT NULL DEFAULT FALSE,
-    active     BOOLEAN      NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    id          UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    product_id  UUID         NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    min_price   NUMERIC(12,2),
+    max_price   NUMERIC(12,2),
+    paused      BOOLEAN      NOT NULL DEFAULT FALSE,
+    active      BOOLEAN      NOT NULL DEFAULT TRUE,
+    alert_state TEXT         NOT NULL DEFAULT '', -- '' | 'up' | 'down': direction of last alert
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     UNIQUE(user_id, product_id)
 );
+
+-- Idempotent upgrade for databases created before alert_state existed.
+-- This whole file is safe to re-run against an existing database:
+--   docker compose exec postgres psql -U pricescount -d pricescount -f /docker-entrypoint-initdb.d/init.sql
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS alert_state TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS price_history (
     id         UUID         PRIMARY KEY DEFAULT gen_random_uuid(),

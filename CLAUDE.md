@@ -367,6 +367,7 @@ type ScraperTask struct {
     Platform    string    `json:"platform"`
     ScheduledAt time.Time `json:"scheduled_at"`
     Force       bool      `json:"force,omitempty"`
+    ChatID      int64     `json:"chat_id,omitempty"` // c Force: результат получает только этот чат
 }
 
 type PriceResult struct {
@@ -380,6 +381,8 @@ type PriceResult struct {
     ScrapedAt time.Time `json:"scraped_at"`
     Success   bool      `json:"success"`
     Error     string    `json:"error,omitempty"`
+    Force     bool      `json:"force,omitempty"`
+    ChatID    int64     `json:"chat_id,omitempty"` // c Force: результат получает только этот чат
 }
 
 type TrackRequest struct {
@@ -388,6 +391,7 @@ type TrackRequest struct {
     URL             string `json:"url"`
     Platform        string `json:"platform"`
     IntervalHours   int    `json:"interval_hours,omitempty"`
+    ChatID          int64  `json:"chat_id,omitempty"` // для action=force: чат инициатора
 }
 
 type NotifyTask struct {
@@ -408,11 +412,13 @@ Telegram bot, только HTTP-клиент к Gateway. Никакого пря
 - Команды: `/start`, `/cancel`, `/mylist`
 - Действия: pause · resume · delete · force check · history · edit thresholds
 
-Config: `TELEGRAM_BOT_TOKEN`, `GATEWAY_URL`
+Config: `TELEGRAM_BOT_TOKEN`, `GATEWAY_URL`, `INTERNAL_TOKEN` (shared secret, заголовок `X-Internal-Token` во всех запросах к Gateway)
 
 ### Gateway (`services/gateway`)
 
 Stateless HTTP-сервер + два фоновых goroutine. Никакого chromedp.
+
+Все эндпоинты требуют заголовок `X-Internal-Token` (shared secret с Bot). Лимит тела запроса 1 MiB. `POST /lookup` отвечает 429, если в очереди уже ≥25 pending lookup-ов.
 
 **REST API:**
 - `POST /lookup` — INSERT lookup_requests(pending), publish lookup.tasks → 202 {lookup_id}
@@ -422,14 +428,15 @@ Stateless HTTP-сервер + два фоновых goroutine. Никакого 
 - `PATCH /subscriptions/:id` — pause / resume / edit thresholds, publish track.requests
 - `DELETE /subscriptions/:id` — soft delete, publish track.requests{delete}
 - `GET /subscriptions/:id/history` — точки графика цены
-- `POST /subscriptions/:id/check` — publish track.requests{force}
+- `POST /subscriptions/:id/check` — publish track.requests{force, chat_id}; статус получает только инициатор
 
 **Background goroutines:**
-- `price.results` consumer: если `lookup_id != ""` → UPDATE lookup_requests(done); иначе → INSERT price_history + проверка порогов + publish notify.tasks
-- TTL cleaner: DELETE lookup_requests WHERE expires_at < NOW() каждые 5 минут
+- `price.results` consumer: если `lookup_id != ""` → UPDATE lookup_requests(done); иначе → INSERT price_history + проверка порогов + publish notify.tasks. Алерты дедуплицируются через `subscriptions.alert_state` (направление последнего алерта): повторный скрейп с ценой в той же зоне не шлёт новый алерт.
+- pause/delete подписки публикуют track.requests{pause|delete} только когда у продукта не осталось других активных непаузнутых подписок (scheduled_urls общие для всех пользователей URL).
+- TTL cleaner: каждые 5 минут DELETE lookup_requests WHERE expires_at < NOW() + DELETE price_history старше 90 дней
 - Startup resync: при старте публикует `track.requests{add}` для всех активных продуктов → Scheduler восстанавливает scheduled_urls после чистого деплоя
 
-Config: `POSTGRES_DSN`, `RABBITMQ_URL`, `GATEWAY_ADDR`
+Config: `POSTGRES_DSN`, `RABBITMQ_URL`, `GATEWAY_ADDR`, `INTERNAL_TOKEN` (обязателен)
 
 ### Scheduler (`services/scheduler`)
 
@@ -441,7 +448,7 @@ Config: `POSTGRES_DSN`, `RABBITMQ_URL`, `GATEWAY_ADDR`
   - `resume` → UPDATE next_check_at=NOW()
   - `delete` → DELETE
   - `force` → publish scraper.tasks{Force:true} немедленно + AdvanceNextCheck (чтобы тик не дублировал)
-- Tick loop каждые N минут: `SELECT WHERE next_check_at ≤ NOW() AND active FOR UPDATE SKIP LOCKED` → publish scraper.tasks → UPDATE next_check_at += interval
+- Tick loop каждые N минут (N — частота сканирования, не интервал проверки): `UPDATE ... WHERE next_check_at ≤ NOW() AND active FOR UPDATE SKIP LOCKED RETURNING` → publish scraper.tasks; next_check_at += check_interval_hours (интервал per-URL)
 
 Config: `POSTGRES_DSN`, `RABBITMQ_URL`, `CHECK_INTERVAL_MINUTES`
 
@@ -486,14 +493,15 @@ products (
 )
 
 subscriptions (
-    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id    UUID NOT NULL REFERENCES users(id),
-    product_id UUID NOT NULL REFERENCES products(id),
-    min_price  NUMERIC(12,2),
-    max_price  NUMERIC(12,2),
-    paused     BOOLEAN NOT NULL DEFAULT FALSE,
-    active     BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID NOT NULL REFERENCES users(id),
+    product_id  UUID NOT NULL REFERENCES products(id),
+    min_price   NUMERIC(12,2),
+    max_price   NUMERIC(12,2),
+    paused      BOOLEAN NOT NULL DEFAULT FALSE,
+    active      BOOLEAN NOT NULL DEFAULT TRUE,
+    alert_state TEXT NOT NULL DEFAULT '',  -- '' | 'up' | 'down': направление последнего алерта
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(user_id, product_id)
 )
 
@@ -544,7 +552,7 @@ Module path: `github.com/Gergov00/pricescount/shared`
 ### Setup
 
 ```bash
-cp .env.example .env    # заполнить TELEGRAM_BOT_TOKEN
+cp .env.example .env    # заполнить TELEGRAM_BOT_TOKEN и INTERNAL_TOKEN (openssl rand -hex 24)
 ```
 
 ### Run

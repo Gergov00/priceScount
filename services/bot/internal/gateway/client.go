@@ -14,14 +14,18 @@ import (
 
 // Client is an HTTP client for the Gateway REST API.
 type Client struct {
-	base string
-	http *http.Client
+	base  string
+	token string
+	http  *http.Client
 }
 
-func New(baseURL string) *Client {
+func New(baseURL, token string) *Client {
 	return &Client{
-		base: baseURL,
-		http: &http.Client{Timeout: 70 * time.Second},
+		base:  baseURL,
+		token: token,
+		// Every Gateway endpoint is fast (lookups are async, polled via GET);
+		// a short timeout keeps a stuck Gateway from blocking the bot.
+		http: &http.Client{Timeout: 15 * time.Second},
 	}
 }
 
@@ -182,6 +186,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	req.Header.Set("X-Internal-Token", c.token)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

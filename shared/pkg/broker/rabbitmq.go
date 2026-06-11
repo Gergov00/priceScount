@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -19,8 +20,13 @@ const (
 )
 
 // Connection wraps an AMQP connection and a default channel.
+// Publish transparently redials once if the connection or channel has died;
+// consumers are not redialed — a closed delivery channel is expected to
+// terminate the service so the supervisor (docker restart) re-establishes it.
 type Connection struct {
-	url  string
+	url string
+
+	mu   sync.Mutex // guards conn/ch replacement during redial
 	conn *amqp.Connection
 	ch   *amqp.Channel
 }
@@ -74,16 +80,71 @@ func (c *Connection) DeclareQueue(name string) error {
 }
 
 // Publish JSON-encodes v and publishes it as a persistent message to queue.
+// If the underlying connection has died it redials once and retries.
 func (c *Connection) Publish(ctx context.Context, queue string, v any) error {
 	body, err := json.Marshal(v)
 	if err != nil {
 		return fmt.Errorf("json marshal: %w", err)
 	}
-	return c.ch.PublishWithContext(ctx, "", queue, false, false, amqp.Publishing{
+	msg := amqp.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
 		Body:         body,
-	})
+	}
+
+	if err := c.publishOn(ctx, queue, msg); err == nil {
+		return nil
+	} else if !c.isDead() {
+		return err
+	}
+
+	if err := c.redial(); err != nil {
+		return fmt.Errorf("publish redial: %w", err)
+	}
+	return c.publishOn(ctx, queue, msg)
+}
+
+func (c *Connection) publishOn(ctx context.Context, queue string, msg amqp.Publishing) error {
+	c.mu.Lock()
+	ch := c.ch
+	c.mu.Unlock()
+	return ch.PublishWithContext(ctx, "", queue, false, false, msg)
+}
+
+func (c *Connection) isDead() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn == nil || c.conn.IsClosed() || c.ch.IsClosed()
+}
+
+// redial re-establishes the connection and default channel after a drop.
+func (c *Connection) redial() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn != nil && !c.conn.IsClosed() && !c.ch.IsClosed() {
+		return nil // another goroutine already redialed
+	}
+	if c.conn != nil {
+		c.conn.Close()
+	}
+	slog.Warn("rabbitmq connection lost, redialing")
+	conn, err := amqp.Dial(c.url)
+	if err != nil {
+		return fmt.Errorf("amqp dial: %w", err)
+	}
+	ch, err := conn.Channel()
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("open channel: %w", err)
+	}
+	if err := ch.Qos(10, 0, false); err != nil {
+		ch.Close()
+		conn.Close()
+		return fmt.Errorf("qos: %w", err)
+	}
+	c.conn = conn
+	c.ch = ch
+	return nil
 }
 
 // Consume registers a consumer on queue using the default channel (prefetch=10).

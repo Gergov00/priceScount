@@ -18,6 +18,7 @@ type ScraperTask struct {
 	Platform    string    `json:"platform"` // "wb"
 	ScheduledAt time.Time `json:"scheduled_at"`
 	Force       bool      `json:"force,omitempty"`
+	ChatID      int64     `json:"chat_id,omitempty"` // set with Force: only this chat gets the result
 }
 
 // PriceResult is published to the price.results queue by the Extractor.
@@ -33,7 +34,8 @@ type PriceResult struct {
 	ScrapedAt time.Time `json:"scraped_at"`
 	Success   bool      `json:"success"`
 	Error     string    `json:"error,omitempty"`
-	Force     bool      `json:"force,omitempty"` // true when triggered by user force-check
+	Force     bool      `json:"force,omitempty"`   // true when triggered by user force-check
+	ChatID    int64     `json:"chat_id,omitempty"` // set with Force: only this chat gets the result
 }
 
 // TrackRequest is published to the track.requests queue to manage scheduled monitoring.
@@ -43,6 +45,7 @@ type TrackRequest struct {
 	URL           string `json:"url"`
 	Platform      string `json:"platform"`
 	IntervalHours int    `json:"interval_hours,omitempty"` // used with action=add
+	ChatID        int64  `json:"chat_id,omitempty"`        // used with action=force: requester chat
 }
 
 // NotifyTask is published to the notify.tasks queue for delivery to the user.

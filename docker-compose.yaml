@@ -2,11 +2,12 @@ services:
   rabbitmq:
     image: rabbitmq:3.13-management-alpine
     ports:
-      - "5672:5672"
-      - "15672:15672"   # management UI
+      # bound to localhost only — never expose the broker to the network
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"   # management UI
     environment:
-      RABBITMQ_DEFAULT_USER: guest
-      RABBITMQ_DEFAULT_PASS: guest
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-pricescount}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-pricescount}
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 10s
@@ -18,10 +19,11 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: pricescount
-      POSTGRES_PASSWORD: pricescount
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pricescount}
       POSTGRES_DB: pricescount
     ports:
-      - "5434:5432"
+      # bound to localhost only — never expose the database to the network
+      - "127.0.0.1:5434:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./migrations/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -39,10 +41,11 @@ services:
     env_file:
       - .env
     environment:
-      POSTGRES_DSN: postgresql://pricescount:pricescount@postgres:5432/pricescount?sslmode=disable
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      POSTGRES_DSN: postgresql://pricescount:${POSTGRES_PASSWORD:-pricescount}@postgres:5432/pricescount?sslmode=disable
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-pricescount}:${RABBITMQ_PASSWORD:-pricescount}@rabbitmq:5672/
     ports:
-      - "8080:8080"
+      # localhost only: the API is internal (Bot reaches it via the docker network)
+      - "127.0.0.1:8080:8080"
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -57,8 +60,8 @@ services:
     env_file:
       - .env
     environment:
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      POSTGRES_DSN: postgresql://pricescount:pricescount@postgres:5432/pricescount?sslmode=disable
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-pricescount}:${RABBITMQ_PASSWORD:-pricescount}@rabbitmq:5672/
+      POSTGRES_DSN: postgresql://pricescount:${POSTGRES_PASSWORD:-pricescount}@postgres:5432/pricescount?sslmode=disable
       CHECK_INTERVAL_MINUTES: "1"
     depends_on:
       rabbitmq:
@@ -74,7 +77,7 @@ services:
     env_file:
       - .env
     environment:
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-pricescount}:${RABBITMQ_PASSWORD:-pricescount}@rabbitmq:5672/
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -87,7 +90,7 @@ services:
     env_file:
       - .env
     environment:
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-pricescount}:${RABBITMQ_PASSWORD:-pricescount}@rabbitmq:5672/
     depends_on:
       rabbitmq:
         condition: service_healthy

@@ -2,11 +2,16 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// ErrNotFound is returned when a requested row does not exist.
+var ErrNotFound = errors.New("not found")
 
 type Store struct {
 	db *pgxpool.Pool
@@ -54,6 +59,9 @@ func (s *Store) GetLookup(ctx context.Context, id string) (*LookupResult, error)
 		`SELECT id, url, status, name, price, error FROM lookup_requests WHERE id = $1`,
 		id,
 	).Scan(&r.ID, &r.URL, &r.Status, &name, &price, &errStr)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("get lookup %s: %w", id, ErrNotFound)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("get lookup: %w", err)
 	}
@@ -70,8 +78,12 @@ func (s *Store) GetLookup(ctx context.Context, id string) (*LookupResult, error)
 }
 
 func (s *Store) CompleteLookup(ctx context.Context, lookupID, name string, price float64) error {
+	// Completed lookups get a longer TTL: the user may take a while to answer
+	// the min/max price questions before the subscription is created.
 	_, err := s.db.Exec(ctx,
-		`UPDATE lookup_requests SET status='done', name=$2, price=$3 WHERE id=$1`,
+		`UPDATE lookup_requests
+		 SET status='done', name=$2, price=$3, expires_at = NOW() + INTERVAL '1 hour'
+		 WHERE id=$1`,
 		lookupID, name, price,
 	)
 	if err != nil {
@@ -101,6 +113,19 @@ func (s *Store) DeleteExpiredLookups(ctx context.Context) (int64, error) {
 	return tag.RowsAffected(), nil
 }
 
+// PendingLookupCount returns the number of lookups still waiting for the extractor.
+// Used as backpressure: each lookup costs a headless-Chrome page load.
+func (s *Store) PendingLookupCount(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM lookup_requests WHERE status='pending'`,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("pending lookup count: %w", err)
+	}
+	return n, nil
+}
+
 // ─── Users ───────────────────────────────────────────────────────────────────
 
 func (s *Store) UpsertUser(ctx context.Context, chatID int64) (string, error) {
@@ -117,25 +142,37 @@ func (s *Store) UpsertUser(ctx context.Context, chatID int64) (string, error) {
 	return id, nil
 }
 
-// ─── Products ────────────────────────────────────────────────────────────────
-
-func (s *Store) UpsertProduct(ctx context.Context, id, name, url, platform string) error {
-	_, err := s.db.Exec(ctx,
-		`INSERT INTO products(id, name, url, platform) VALUES($1, $2, $3, $4)
-		 ON CONFLICT(url) DO UPDATE SET name=EXCLUDED.name`,
-		id, name, url, platform,
-	)
-	if err != nil {
-		return fmt.Errorf("upsert product: %w", err)
+// UserIDByChatID resolves an existing user without creating one.
+// Read-only endpoints use this so unauthenticated chat_id probing
+// does not fill the users table.
+func (s *Store) UserIDByChatID(ctx context.Context, chatID int64) (string, error) {
+	var id string
+	err := s.db.QueryRow(ctx, `SELECT id FROM users WHERE chat_id=$1`, chatID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("user by chat_id %d: %w", chatID, ErrNotFound)
 	}
-	return nil
+	if err != nil {
+		return "", fmt.Errorf("user by chat_id: %w", err)
+	}
+	return id, nil
 }
 
-func (s *Store) ProductIDByURL(ctx context.Context, url string) (string, error) {
+// ─── Products ────────────────────────────────────────────────────────────────
+
+// EnsureProduct inserts a product with the given candidate id, or — when a row
+// with the same URL already exists — refreshes its name and returns the existing
+// id. One atomic statement, so two concurrent subscriptions to the same new URL
+// cannot race into a foreign-key violation.
+func (s *Store) EnsureProduct(ctx context.Context, candidateID, name, url, platform string) (string, error) {
 	var id string
-	err := s.db.QueryRow(ctx, `SELECT id FROM products WHERE url=$1`, url).Scan(&id)
+	err := s.db.QueryRow(ctx,
+		`INSERT INTO products(id, name, url, platform) VALUES($1, $2, $3, $4)
+		 ON CONFLICT(url) DO UPDATE SET name=EXCLUDED.name
+		 RETURNING id`,
+		candidateID, name, url, platform,
+	).Scan(&id)
 	if err != nil {
-		return "", fmt.Errorf("product by url: %w", err)
+		return "", fmt.Errorf("ensure product: %w", err)
 	}
 	return id, nil
 }
@@ -205,10 +242,35 @@ func (s *Store) GetSubscription(ctx context.Context, subID, userID string) (*Sub
 		subID, userID,
 	).Scan(&sub.ID, &sub.ProductID, &sub.ProductName, &sub.ProductURL,
 		&sub.MinPrice, &sub.MaxPrice, &sub.Paused)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("get subscription %s: %w", subID, ErrNotFound)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("get subscription: %w", err)
 	}
 	return &sub, nil
+}
+
+// SubCounts reports how many subscriptions a product still has: total active
+// ones and the subset that is not paused. Gateway uses this to decide whether
+// pausing/deleting one user's subscription should stop monitoring the URL.
+type SubCounts struct {
+	Active   int // active = true, paused or not
+	Watching int // active = true AND paused = false
+}
+
+func (s *Store) ProductSubCounts(ctx context.Context, productID string) (SubCounts, error) {
+	var c SubCounts
+	err := s.db.QueryRow(ctx,
+		`SELECT COUNT(*), COUNT(*) FILTER (WHERE paused = false)
+		 FROM subscriptions
+		 WHERE product_id = $1 AND active = true`,
+		productID,
+	).Scan(&c.Active, &c.Watching)
+	if err != nil {
+		return SubCounts{}, fmt.Errorf("product sub counts: %w", err)
+	}
+	return c, nil
 }
 
 func (s *Store) PauseSubscription(ctx context.Context, subID, userID string) error {
@@ -228,8 +290,9 @@ func (s *Store) ResumeSubscription(ctx context.Context, subID, userID string) er
 }
 
 func (s *Store) UpdateThresholds(ctx context.Context, subID, userID string, minPrice, maxPrice float64) error {
+	// New thresholds mean the previous alert direction is stale — reset it.
 	_, err := s.db.Exec(ctx,
-		`UPDATE subscriptions SET min_price=$3, max_price=$4 WHERE id=$1 AND user_id=$2`,
+		`UPDATE subscriptions SET min_price=$3, max_price=$4, alert_state='' WHERE id=$1 AND user_id=$2`,
 		subID, userID, minPrice, maxPrice,
 	)
 	return err
@@ -260,6 +323,18 @@ func (s *Store) SavePrice(ctx context.Context, productID string, price float64, 
 		return fmt.Errorf("save price: %w", err)
 	}
 	return nil
+}
+
+// DeleteOldPriceHistory removes price points older than the retention window.
+func (s *Store) DeleteOldPriceHistory(ctx context.Context, olderThan time.Duration) (int64, error) {
+	tag, err := s.db.Exec(ctx,
+		`DELETE FROM price_history WHERE scraped_at < NOW() - $1::interval`,
+		fmt.Sprintf("%d seconds", int(olderThan.Seconds())),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("delete old price history: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 func (s *Store) PriceHistory(ctx context.Context, productID string, limit int) ([]PricePoint, error) {
@@ -320,20 +395,24 @@ func (s *Store) AllActiveProducts(ctx context.Context) ([]ActiveProduct, error) 
 
 // ─── Threshold checking ───────────────────────────────────────────────────────
 
-type TriggeredSub struct {
-	UserID      string
+// ProductSub is an active non-paused subscription with its alert deduplication
+// state. AlertState holds the direction of the last alert sent ("up", "down")
+// or "" when the price was last seen inside the range.
+type ProductSub struct {
+	SubID       string
 	ChatID      int64
 	ProductName string
 	ProductURL  string
 	MinPrice    float64
 	MaxPrice    float64
+	AlertState  string
 }
 
-// ActiveSubscriptions returns all active non-paused subscriptions for a product.
-// Used for force-check results where we notify regardless of price thresholds.
-func (s *Store) ActiveSubscriptions(ctx context.Context, productID string) ([]TriggeredSub, error) {
+// ProductSubscriptions returns all active non-paused subscriptions for a product.
+func (s *Store) ProductSubscriptions(ctx context.Context, productID string) ([]ProductSub, error) {
 	rows, err := s.db.Query(ctx,
-		`SELECT u.id, u.chat_id, p.name, p.url, COALESCE(s.min_price, 0), COALESCE(s.max_price, 0)
+		`SELECT s.id, u.chat_id, p.name, p.url,
+		        COALESCE(s.min_price, 0), COALESCE(s.max_price, 0), s.alert_state
 		 FROM subscriptions s
 		 JOIN users u ON u.id = s.user_id
 		 JOIN products p ON p.id = s.product_id
@@ -343,50 +422,31 @@ func (s *Store) ActiveSubscriptions(ctx context.Context, productID string) ([]Tr
 		productID,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("active subscriptions: %w", err)
+		return nil, fmt.Errorf("product subscriptions: %w", err)
 	}
 	defer rows.Close()
 
-	var subs []TriggeredSub
+	var subs []ProductSub
 	for rows.Next() {
-		var sub TriggeredSub
-		if err := rows.Scan(&sub.UserID, &sub.ChatID, &sub.ProductName, &sub.ProductURL,
-			&sub.MinPrice, &sub.MaxPrice); err != nil {
-			return nil, err
+		var sub ProductSub
+		if err := rows.Scan(&sub.SubID, &sub.ChatID, &sub.ProductName, &sub.ProductURL,
+			&sub.MinPrice, &sub.MaxPrice, &sub.AlertState); err != nil {
+			return nil, fmt.Errorf("scan product subscription: %w", err)
 		}
 		subs = append(subs, sub)
 	}
 	return subs, rows.Err()
 }
 
-func (s *Store) TriggeredSubscriptions(ctx context.Context, productID string, price float64) ([]TriggeredSub, error) {
-	rows, err := s.db.Query(ctx,
-		`SELECT u.id, u.chat_id, p.name, p.url, s.min_price, s.max_price
-		 FROM subscriptions s
-		 JOIN users u ON u.id = s.user_id
-		 JOIN products p ON p.id = s.product_id
-		 WHERE s.product_id = $1
-		   AND s.active = true
-		   AND s.paused = false
-		   AND (
-		       ($2 < s.min_price AND s.min_price IS NOT NULL) OR
-		       ($2 > s.max_price AND s.max_price IS NOT NULL)
-		   )`,
-		productID, price,
+// SetAlertState records the direction of the last alert ("up", "down" or "")
+// so repeated scrapes with the price still out of range do not re-alert.
+func (s *Store) SetAlertState(ctx context.Context, subID, alertState string) error {
+	_, err := s.db.Exec(ctx,
+		`UPDATE subscriptions SET alert_state=$2 WHERE id=$1`,
+		subID, alertState,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("triggered subscriptions: %w", err)
+		return fmt.Errorf("set alert state: %w", err)
 	}
-	defer rows.Close()
-
-	var subs []TriggeredSub
-	for rows.Next() {
-		var sub TriggeredSub
-		if err := rows.Scan(&sub.UserID, &sub.ChatID, &sub.ProductName, &sub.ProductURL,
-			&sub.MinPrice, &sub.MaxPrice); err != nil {
-			return nil, err
-		}
-		subs = append(subs, sub)
-	}
-	return subs, rows.Err()
+	return nil
 }

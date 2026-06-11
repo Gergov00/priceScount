@@ -153,6 +153,7 @@ func (c *Consumer) handleScraper(ctx context.Context, d amqp.Delivery) {
 		URL:       task.URL,
 		ScrapedAt: time.Now().UTC(),
 		Force:     task.Force,
+		ChatID:    task.ChatID,
 	}
 	if err != nil {
 		log.Error("scraper fetch failed", "error", err)

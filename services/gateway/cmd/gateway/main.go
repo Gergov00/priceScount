@@ -88,10 +88,15 @@ func newConsumer(mq *broker.Connection, st *store.Store) *consumer.Consumer {
 	return consumer.New(mq, st)
 }
 
-func newRouter(h *handler.Handler) *gin.Engine {
+func newRouter(h *handler.Handler, cfg *config.Config) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
-	r.Use(gin.Recovery(), handler.RequestLogger())
+	r.Use(
+		gin.Recovery(),
+		handler.RequestLogger(),
+		handler.BodyLimit(1<<20), // 1 MiB is plenty for any of our JSON bodies
+		handler.Auth(cfg.InternalToken),
+	)
 	h.Register(r)
 	return r
 }
@@ -144,7 +149,7 @@ func runCleaner(lc fx.Lifecycle, st *store.Store) {
 	ctx, cancel := context.WithCancel(context.Background())
 	lc.Append(fx.Hook{
 		OnStart: func(_ context.Context) error {
-			go cleaner.Run(ctx, st, 5*time.Minute)
+			go cleaner.Run(ctx, st, 5*time.Minute, 90*24*time.Hour)
 			return nil
 		},
 		OnStop: func(_ context.Context) error {
