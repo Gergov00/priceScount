@@ -46,6 +46,7 @@ func (s *Store) ApplySnapshot(ctx context.Context, request contracts.TrackReques
 	if err != nil {
 		return fmt.Errorf("begin monitoring snapshot: %w", err)
 	}
+	// Rollback releases the advisory lock and cleans up partial work on error paths.
 	defer func() { _ = tx.Rollback(ctx) }()
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, productID.String()); err != nil {
 		return fmt.Errorf("lock snapshot product: %w", err)
@@ -95,6 +96,7 @@ func (s *Store) EnqueueDue(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("begin due enqueue: %w", err)
 	}
+	// Rollback cleans up the transaction if selecting or writing any due task fails.
 	defer func() { _ = tx.Rollback(ctx) }()
 	rows, err := tx.Query(ctx,
 		`SELECT id,product_id,url,platform,check_interval_hours FROM scheduled_urls
@@ -156,13 +158,25 @@ func (s *Store) EnqueueForce(ctx context.Context, request contracts.TrackRequest
 	if err != nil {
 		return fmt.Errorf("begin force enqueue: %w", err)
 	}
+	// Rollback releases the transaction-scoped advisory lock and discards partial work on errors.
 	defer func() { _ = tx.Rollback(ctx) }()
-	var actualProduct string
-	err = tx.QueryRow(ctx, `SELECT product_id::text FROM scheduled_urls WHERE url=$1 FOR SHARE`, request.URL).Scan(&actualProduct)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("lookup force URL: %w", err)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, productID.String()); err != nil {
+		return fmt.Errorf("lock force product identity: %w", err)
 	}
-	if err == nil && actualProduct != productID.String() {
+	var actualURL string
+	productErr := tx.QueryRow(ctx, `SELECT url FROM scheduled_urls WHERE product_id=$1 FOR SHARE`, productID).Scan(&actualURL)
+	if productErr != nil && !errors.Is(productErr, pgx.ErrNoRows) {
+		return fmt.Errorf("lookup force product: %w", productErr)
+	}
+	if productErr == nil && actualURL != request.URL {
+		return fmt.Errorf("force product/URL mismatch: %w", ErrInvalidRequest)
+	}
+	var actualProduct string
+	urlErr := tx.QueryRow(ctx, `SELECT product_id::text FROM scheduled_urls WHERE url=$1 FOR SHARE`, request.URL).Scan(&actualProduct)
+	if urlErr != nil && !errors.Is(urlErr, pgx.ErrNoRows) {
+		return fmt.Errorf("lookup force URL: %w", urlErr)
+	}
+	if urlErr == nil && actualProduct != productID.String() {
 		return fmt.Errorf("force URL/product mismatch: %w", ErrInvalidRequest)
 	}
 	tag, err := tx.Exec(ctx, `INSERT INTO processed_force_commands(task_id,product_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, taskID, productID)

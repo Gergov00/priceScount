@@ -11,4 +11,5 @@ var ErrInvalidRequest = errors.New("invalid scheduler request")
 
 type Store struct{ db *pgxpool.Pool }
 
+// New creates a Scheduler store backed by the PostgreSQL connection pool.
 func New(db *pgxpool.Pool) *Store { return &Store{db: db} }

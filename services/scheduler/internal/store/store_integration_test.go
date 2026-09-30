@@ -137,6 +137,43 @@ func TestSnapshotRejectsURLProductMismatch(t *testing.T) {
 		t.Fatalf("mismatch error=%v", err)
 	}
 }
+
+func TestForceProductURLMismatchDoesNotConsumeTaskID(t *testing.T) {
+	st, db := integrationStore(t)
+	ctx := t.Context()
+	productID := uuid.NewString()
+	existingURL := "https://www.wildberries.ru/catalog/114/detail.aspx"
+	wrongURL := "https://www.wildberries.ru/catalog/115/detail.aspx"
+	taskID := uuid.NewString()
+	if err := st.ApplySnapshot(ctx, snapshot(productID, existingURL, 1, true)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.EnqueueForce(ctx, force(productID, taskID, wrongURL)); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("wrong product URL error=%v", err)
+	}
+	var processed, events int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM processed_force_commands WHERE task_id=$1`, taskID).Scan(&processed); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM scheduler_outbox WHERE event_key=$1`, "force:"+taskID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if processed != 0 || events != 0 {
+		t.Fatalf("invalid force consumed task: processed=%d events=%d", processed, events)
+	}
+	if err := st.EnqueueForce(ctx, force(productID, taskID, existingURL)); err != nil {
+		t.Fatalf("correct retry with same TaskID: %v", err)
+	}
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM processed_force_commands WHERE task_id=$1`, taskID).Scan(&processed); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM scheduler_outbox WHERE event_key=$1`, "force:"+taskID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if processed != 1 || events != 1 {
+		t.Fatalf("valid retry was not persisted once: processed=%d events=%d", processed, events)
+	}
+}
 func TestDueOutboxRollback(t *testing.T) {
 	st, db := integrationStore(t)
 	ctx := t.Context()
