@@ -1,6 +1,6 @@
 # Audit repair implementation results
 
-Implementation evidence for the 15 findings S1–S8/F4–F10 is summarized below. Task 1–5 production changes and scoped commits were independently reviewed by the controller. Task 6 persistence, deployment, CI, and missing-test work is implemented on top of `3cbf96e`; a fresh independent review of the final Task 6 diff is pending. This report records evidence, not a production deployment approval.
+Implementation evidence for the 15 findings S1–S8/F4–F10 is summarized below. Task 1–5 changes and Task 6 persistence/deployment work were independently reviewed. The Task 6 review of `3cbf96e..381f6ea` found one P1 RabbitMQ node identity cutover risk, fixed in `c218a82`; whole-branch review of `381f6ea` found one P2 outbox lease race, fixed in `23091a2`. The independent scoped reviews and fresh whole-branch verification passed on `23091a2`; see evidence below. This report records evidence, not a production deployment approval.
 
 | Finding | Evidence in implementation and tests | Verification |
 | --- | --- | --- |
@@ -29,14 +29,29 @@ Follow-up from independent Task 6 review: `RABBITMQ_HOSTNAME`, `RABBITMQ_NODENAM
 
 Follow-up from whole-branch review: the shared outbox worker now claims one event immediately before publishing. `TestWorkerClaimsNextEventOnlyWhenReadyToPublish` uses a controllable lease clock and seven simulated 9-second successful confirms, then holds event 8 after the former 60-second batch lease would have elapsed; worker 2 claims/publishes the still-unclaimed event 9 without concurrently publishing event 8. Against the former 20-event limit the test failed with `same outbox event published concurrently: "event-8"`; with claim limit one, `go test -race -count=1 -timeout=120s ./pkg/outbox` passed. This uses more claim transactions per event. The unavoidable at-least-once window after broker confirm and before marking the row published remains.
 
+## Independent review outcomes
+
+- The Task 6 scoped review found that the replacement broker identity was hardcoded and could not open copied Mnesia data under the recorded old node identity. Commit `c218a82` added configurable hostname, exact nodename, and long-name mode; isolated Compose config checks verified defaults and fake legacy overrides without starting services. The source broker and anonymous volume remain in place until ready and unacknowledged messages on the restored broker are verified.
+- The whole-branch review found that a 20-event claim could let queued rows' 60-second leases expire while earlier events were being confirmed. Commit `23091a2` claims one event immediately before its publish. The controlled-clock test failed against the former batch with a concurrent `event-8` publish after seven simulated 9-second confirms, and passes with one-at-a-time claims. This costs one claim transaction per event and may reduce peak throughput; it avoids adding lease-renewal machinery. The confirm-to-mark process-crash window remains at-least-once.
+
+The Task 6 scoped review of `3cbf96e..381f6ea` and whole-branch review of `a7a097c..381f6ea` passed after the corresponding fixes. The controller's fresh verification on `23091a2` passed all-six integration/regression race tests, build, vet, all five Docker rebuilds, and a fresh coverage run. No further findings remain from those reviews.
+
+## Recorded implementation rulings
+
+1. Implementation stayed in the current checkout and branch `codex/audit-repair`, preserving pre-existing test/planning artifacts. Creating a worktree would have added directory isolation at the cost of copying that state; if the choice were wrong, Git provides the reversible path. Commits remain local; there was no push, merge, or deployment.
+2. Task 5 scope includes Extractor consumer and command shutdown. Canceling Chromium alone could leave sibling consumers running after queue failure and close dependencies before workers exited. The extension added two focused files and lifecycle tests; it is reversible if that risk assumption were wrong.
+3. The outbox claims one event immediately before publishing. The trade-off is one extra claim transaction per event and potentially lower peak throughput; the change avoids renewal machinery and is reversible. The process-crash window after broker confirmation but before marking the row remains at-least-once.
+
 ## Verification on 2026-10-01
 
 - All six Go modules: `go test -race -count=1 -timeout=120s ./services/bot/... ./services/gateway/... ./services/scheduler/... ./services/extractor/... ./services/notifier/... ./shared/...` passed. The workspace root does not traverse these modules with `./...`.
-- `scripts/test-integration.ps1 -Coverage` passed on isolated PostgreSQL 16/RabbitMQ 3.13 project `pricescount-tests-7c21802065b4`; statement coverage was 55.6%. The runner removed its project.
+- The initial `scripts/test-integration.ps1 -Coverage` run before the final outbox-helper follow-up passed on isolated PostgreSQL 16/RabbitMQ 3.13 project `pricescount-tests-7c21802065b4`; statement coverage was 55.6%. The runner removed its project.
 - `scripts/test-integration.ps1 -Regression` passed on isolated project `pricescount-tests-02b1edaaf331`; the runner removed its project.
 - Controller independently confirmed all-six integration/regression race tests, `go build`, and `go vet`; after the last helper-only change, `shared` race and vet passed again.
 - All five root-context Docker builds passed with `pricescount-audit-*` tags.
+- After review fixes, the controller freshly reran all-six integration/regression race tests, build, and vet on commit `23091a2`; all passed. The controller also rebuilt all five Docker images on the reviewed branch and reported success.
+- After the final review fixes, `scripts/test-integration.ps1 -Coverage` passed on isolated project `pricescount-tests-d24b51a48379`, which the runner cleaned. Final aggregate statement coverage was 54.9%; `shared/cmd/testhelper` contributes 0%, and `shared/pkg/outbox` reports 56.9%. The earlier run reported 55.6% on a different run/revision; no cause for that aggregate difference is inferred.
 - Broker recovery initially hit two test-harness defects (strict access to a not-yet-present management counter; then an incorrect assumption that the production wrapper's `Close` returns an error). The two isolated failed projects are recorded in `tests/TEST_REPORT.md`, inspected and removed. After fixes, a fresh run recovered the original confirmed persistent message and cleaned its own project.
 - `git diff --check` passed. Browser cancellation PASS is prior controller evidence, not a test rerun for Task 6.
 
-Coverage is not 100%. No real Telegram or Wildberries calls, production containers, production volumes, or production data were accessed. The final independent controller review is pending.
+Coverage is not 100%. No real Telegram or Wildberries calls, production containers, production volumes, or production data were accessed. No production deployment occurred, and the CI workflow itself was not executed as a GitHub Actions run; local equivalents were recorded above.

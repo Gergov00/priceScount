@@ -149,11 +149,11 @@
 - [x] Add CI unit/integration race, build и vet всех шести модулей; build Docker images; cache Go. Перевести закрытые regression checks в основной набор.
 - [x] Add isolated broker recovery script: unique Compose project с собственным named volume, durable queue и publisher-confirmed persistent task; forced recreate с тем же hostname/volume и consumption прежнего body. Добавить PostgreSQL upgrade fixture и duplicate preflight test.
 - [x] Run all six module unit/race, `scripts/test-integration.ps1 -Coverage` and `-Regression`, build/vet всех модулей, Docker builds, recovery script и shutdown smoke checks. Записать фактические результаты и ограничения Chrome/externals.
-- [ ] Fresh independent controller review всего diff против spec и CLAUDE.md, особо lease races/confirm returns/deploy compatibility. Исправить существенные замечания и повторить затронутые проверки.
+- [x] Fresh independent controller review всего diff против spec и CLAUDE.md, особо lease races/confirm returns/deploy compatibility. P1 RabbitMQ node identity fix `c218a82`; P2 outbox lease fix `23091a2`; scoped and whole-branch reviews PASS, affected all-six race/build/vet, five Docker rebuilds and final coverage run PASS (54.9%).
 - [x] Write closure matrix S1–S8/F4–F10 с production files, test names и результатами; scoped commit, не push/merge/deploy.
 
 ## Self-review и handoff
 
 Все строки coverage matrix spec распределены по задачам: S1/F10/S5 — 5; S2/F4/F5/F7/F8/F9 — 2; S6/F6 — 3; S3/S4/S8 — 4–5; S7 — 6. Review Focus имеет конкретные проверки в задачах. Интерфейсы outbox общие, SQL принадлежит service store; sequential execution исключает одновременные правки contracts/schema/wiring.
 
-Пользователь уже выбрал исполнение с субагентами Luna/low. Перед началом production-кода требуется просмотр этого плана пользователем согласно writing-plans; следующий шаг после подтверждения — subagent-driven-development, один implementer и затем reviewer на этап. Уже написанные тесты сохраняются и адаптируются только при смене внутреннего контракта, недостающие добавляются после исправлений по последнему указанию пользователя.
+Исполнение завершено в соответствии с одобренными дизайном и планом. Scoped implementation commits Task 1–6 остаются в локальной ветке `codex/audit-repair`; итоговая матрица, независимые review outcomes и фактические проверки приведены в `docs/AUDIT_REPAIR_RESULT.md`.

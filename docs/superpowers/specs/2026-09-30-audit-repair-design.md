@@ -1,6 +1,6 @@
 # Исправление замечаний review priceScount
 
-Статус: дизайн подтверждён 2026-09-30; реализация завершена, фактические изменения и проверки зафиксированы в [docs/AUDIT_REPAIR_RESULT.md](../../AUDIT_REPAIR_RESULT.md). Независимый итоговый review контроллера ожидается.
+Статус: дизайн подтверждён 2026-09-30; реализация и независимый итоговый review завершены. Свежие race/build/vet, пять Docker builds и integration coverage проверки прошли; финальное statement coverage — 54,9%. Фактические изменения, найденные замечания и проверки зафиксированы в [docs/AUDIT_REPAIR_RESULT.md](../../AUDIT_REPAIR_RESULT.md); production cutover не выполнялся.
 
 ## Цель и критерии успеха
 
@@ -91,6 +91,6 @@ RabbitMQ получает named volume `/var/lib/rabbitmq` и стабильны
 
 ## Последовательность реализации после одобрения
 
-Подробный implementation plan составляется через `superpowers:writing-plans`. Задачи: (1) broker/outbox primitive и тесты; (2) Gateway транзакции/версии/идемпотентные результаты; (3) Scheduler outbox/versioning/force; (4) Notifier/context/retry/security; (5) Bot concurrency/pagination и WB cancellation; (6) миграции, deployment, документация, CI и общий review. Один implementer за раз, независимый reviewer после задачи; все субагенты Luna/low. Перекрывающиеся production-файлы не редактируются параллельно.
+Реализация выполнена по отдельному `superpowers:writing-plans` плану: (1) broker/outbox primitive; (2) Gateway транзакции/версии/результаты; (3) Scheduler outbox/versioning/force; (4) Notifier/context/retry/security; (5) Bot ordering/pagination и WB cancellation; (6) миграции, deployment, документация, CI и итоговый review. Рабочие этапы выполнялись последовательно, production-файлы не перекрывались.
 
-Существующий `PROJECT_REVIEW.md` сохраняется как исходный отчёт. Итоговый документ отдельно отмечает закрытие каждого замечания и реально выполненные проверки. Дизайн и план были просмотрены до начала реализации; текущий статус и фактические результаты реализации см. в итоговом отчёте. Окончательное закрытие ожидает независимого review.
+Существующий `PROJECT_REVIEW.md` сохраняется как исходный отчёт. Итоговый документ отдельно отмечает закрытие каждого замечания и реально выполненные проверки. Дизайн и план были просмотрены до начала реализации; итоговый review и все предусмотренные локальные проверки завершены. Фактические результаты см. в итоговом отчёте.
