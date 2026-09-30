@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS products (
     platform   TEXT        NOT NULL, -- "wb"
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE products ADD COLUMN IF NOT EXISTS monitor_version BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS latest_result_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS subscriptions (
     id          UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -33,6 +35,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 -- This whole file is safe to re-run against an existing database:
 --   docker compose exec postgres psql -U pricescount -d pricescount -f /docker-entrypoint-initdb.d/init.sql
 ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS alert_state TEXT NOT NULL DEFAULT '';
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS alert_version BIGINT NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS price_history (
     id         UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -41,6 +44,57 @@ CREATE TABLE IF NOT EXISTS price_history (
     currency   VARCHAR(3)   NOT NULL DEFAULT 'RUB',
     scraped_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
+ALTER TABLE price_history ADD COLUMN IF NOT EXISTS task_id UUID;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_price_history_task_id ON price_history(task_id) WHERE task_id IS NOT NULL;
+UPDATE products p
+SET latest_result_at = h.latest_scraped_at
+FROM (
+    SELECT product_id, MAX(scraped_at) AS latest_scraped_at
+    FROM price_history
+    GROUP BY product_id
+) h
+WHERE p.id = h.product_id AND p.latest_result_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS processed_price_results (
+    task_id UUID PRIMARY KEY,
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS force_requests (
+    task_id UUID PRIMARY KEY,
+    product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    chat_id BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS gateway_outbox (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_key TEXT NOT NULL UNIQUE,
+    queue TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    attempts INT NOT NULL DEFAULT 0,
+    lease_token UUID,
+    locked_until TIMESTAMPTZ,
+    published_at TIMESTAMPTZ,
+    last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_gateway_outbox_outstanding ON gateway_outbox(available_at, created_at) WHERE published_at IS NULL;
+CREATE TABLE IF NOT EXISTS scheduler_outbox (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_key TEXT NOT NULL UNIQUE,
+    queue TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    attempts INT NOT NULL DEFAULT 0,
+    lease_token UUID,
+    locked_until TIMESTAMPTZ,
+    published_at TIMESTAMPTZ,
+    last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_scheduler_outbox_outstanding ON scheduler_outbox(available_at, created_at) WHERE published_at IS NULL;
 
 -- Temporary table for async one-time product lookups.
 -- Rows expire after 10 minutes and are cleaned up by the Gateway TTL cleaner.

@@ -5,6 +5,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -23,6 +24,7 @@ import (
 	"github.com/Gergov00/pricescount/services/gateway/internal/store"
 	"github.com/Gergov00/pricescount/shared/pkg/broker"
 	"github.com/Gergov00/pricescount/shared/pkg/contracts"
+	sharedoutbox "github.com/Gergov00/pricescount/shared/pkg/outbox"
 )
 
 // testRoutingBroker exercises the real broker with test-owned queue names.
@@ -38,7 +40,7 @@ func (b *testRoutingBroker) Consume(queue, tag string) (<-chan amqp.Delivery, er
 	return b.conn.Consume(b.queues[queue], tag)
 }
 
-func integrationGateway(t *testing.T) (*store.Store, *testRoutingBroker) {
+func integrationGateway(t *testing.T) (*store.Store, *testRoutingBroker, *pgxpool.Pool) {
 	t.Helper()
 	dsn, rabbitURL := os.Getenv("TEST_POSTGRES_DSN"), os.Getenv("TEST_RABBITMQ_URL")
 	if dsn == "" || rabbitURL == "" {
@@ -107,7 +109,7 @@ func integrationGateway(t *testing.T) (*store.Store, *testRoutingBroker) {
 			}
 		})
 	}
-	return store.New(db), routing
+	return store.New(db), routing, db
 }
 
 func integrationDelivery(t *testing.T, deliveries <-chan amqp.Delivery) amqp.Delivery {
@@ -125,11 +127,25 @@ func integrationDelivery(t *testing.T, deliveries <-chan amqp.Delivery) amqp.Del
 }
 
 func TestHTTPSubscriptionsToPriceAlertsIntegration(t *testing.T) {
-	st, mq := integrationGateway(t)
+	st, mq, db := integrationGateway(t)
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.Use(Auth("test-secret"), BodyLimit(1024))
-	New(st, mq).Register(router)
+	New(st).Register(router)
+	workerCtx, stopWorker := context.WithCancel(t.Context())
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- sharedoutbox.New(st, mq).Run(workerCtx) }()
+	t.Cleanup(func() {
+		stopWorker()
+		select {
+		case err := <-workerDone:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("outbox worker shutdown: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("outbox worker did not stop")
+		}
+	})
 	request := func(method, path, body, token string, wantStatus int) *httptest.ResponseRecorder {
 		t.Helper()
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
@@ -193,7 +209,7 @@ func TestHTTPSubscriptionsToPriceAlertsIntegration(t *testing.T) {
 	if err := json.Unmarshal(d.Body, &track); err != nil {
 		t.Fatal(err)
 	}
-	if track.Action != "add" || track.ProductID != created.ProductID || track.URL != task.URL || track.IntervalHours != 1 {
+	if track.Action != "set_state" || !track.Active || track.Version == 0 || track.ProductID != created.ProductID || track.URL != task.URL || track.IntervalHours != 1 {
 		t.Fatalf("track=%+v", track)
 	}
 	if err := d.Ack(false); err != nil {
@@ -242,8 +258,18 @@ func TestHTTPSubscriptionsToPriceAlertsIntegration(t *testing.T) {
 	if err := json.Unmarshal(d.Body, &track); err != nil {
 		t.Fatal(err)
 	}
-	if track.Action != "pause" || track.ProductID != created.ProductID {
-		t.Fatalf("pause track=%+v", track)
+	if track.Action != "set_state" || track.Active || track.ProductID != created.ProductID || track.Version == 0 {
+		var events []string
+		rows, queryErr := db.Query(t.Context(), `SELECT payload::text FROM gateway_outbox WHERE event_key LIKE 'track:%' ORDER BY created_at`)
+		if queryErr == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var e string
+				_ = rows.Scan(&e)
+				events = append(events, e)
+			}
+		}
+		t.Fatalf("pause track=%+v queued=%v", track, events)
 	}
 	if err := d.Ack(false); err != nil {
 		t.Fatal(err)

@@ -172,7 +172,7 @@ func TestEnsureProductConcurrentIntegration(t *testing.T) {
 }
 
 func TestSubscriptionsOwnershipAndLifecycleIntegration(t *testing.T) {
-	st, _ := integrationStore(t)
+	st, db := integrationStore(t)
 	ctx := t.Context()
 	u1, product := seedProduct(t, st)
 	u2, err := st.UpsertUser(ctx, 202)
@@ -199,8 +199,8 @@ func TestSubscriptionsOwnershipAndLifecycleIntegration(t *testing.T) {
 	if _, err := st.GetSubscription(ctx, s1, u2); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("other owner accessed subscription: %v", err)
 	}
-	if err := st.PauseSubscription(ctx, s1, u2); err != nil {
-		t.Fatal(err)
+	if err := st.PauseSubscription(ctx, s1, u2); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("other owner pause error=%v, want not found", err)
 	}
 	sub, err := st.GetSubscription(ctx, s1, u1)
 	if err != nil || sub.Paused {
@@ -209,36 +209,33 @@ func TestSubscriptionsOwnershipAndLifecycleIntegration(t *testing.T) {
 	if err := st.PauseSubscription(ctx, s1, u1); err != nil {
 		t.Fatal(err)
 	}
-	counts, err := st.ProductSubCounts(ctx, product)
-	if err != nil || counts.Active != 2 || counts.Watching != 1 {
-		t.Fatalf("counts=%+v err=%v", counts, err)
+	var activeCount, watchingCount int
+	if err = db.QueryRow(ctx, `SELECT COUNT(*),COUNT(*) FILTER(WHERE NOT paused) FROM subscriptions WHERE product_id=$1 AND active`, product).Scan(&activeCount, &watchingCount); err != nil || activeCount != 2 || watchingCount != 1 {
+		t.Fatalf("active=%d watching=%d err=%v", activeCount, watchingCount, err)
 	}
-	subs, err := st.ProductSubscriptions(ctx, product)
-	if err != nil || len(subs) != 1 || subs[0].SubID != s2 || subs[0].ChatID != 202 {
-		t.Fatalf("watchers=%+v err=%v", subs, err)
+	var watcherCount int
+	if err = db.QueryRow(ctx, `SELECT COUNT(*) FROM subscriptions WHERE product_id=$1 AND active AND NOT paused`, product).Scan(&watcherCount); err != nil || watcherCount != 1 {
+		t.Fatalf("watchers=%d err=%v", watcherCount, err)
 	}
-	products, err := st.AllActiveProducts(ctx)
-	if err != nil || len(products) != 1 || products[0].ProductID != product {
-		t.Fatalf("active products=%+v err=%v", products, err)
+	var activeProducts int
+	if err = db.QueryRow(ctx, `SELECT COUNT(DISTINCT product_id) FROM subscriptions WHERE active AND NOT paused`).Scan(&activeProducts); err != nil || activeProducts != 1 {
+		t.Fatalf("active products=%d err=%v", activeProducts, err)
 	}
 	if err := st.ResumeSubscription(ctx, s1, u1); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SetAlertState(ctx, s1, "up"); err != nil {
+	if _, err := db.Exec(ctx, `UPDATE subscriptions SET alert_state='up' WHERE id=$1`, s1); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.UpdateThresholds(ctx, s1, u1, 120, 250); err != nil {
 		t.Fatal(err)
 	}
-	subs, err = st.ProductSubscriptions(ctx, product)
-	if err != nil {
-		t.Fatal(err)
+	var state string
+	var min, max float64
+	if err = db.QueryRow(ctx, `SELECT alert_state,min_price,max_price FROM subscriptions WHERE id=$1`, s1).Scan(&state, &min, &max); err != nil || state != "" || min != 120 || max != 250 {
+		t.Fatalf("edited subscription state=%q min=%v max=%v err=%v", state, min, max, err)
 	}
-	for _, sub := range subs {
-		if sub.SubID == s1 && (sub.AlertState != "" || sub.MinPrice != 120 || sub.MaxPrice != 250) {
-			t.Fatalf("edited subscription=%+v", sub)
-		}
-	}
+	_ = s2
 	if err := st.DeleteSubscription(ctx, s1, u1); err != nil {
 		t.Fatal(err)
 	}
@@ -252,14 +249,13 @@ func TestSubscriptionsOwnershipAndLifecycleIntegration(t *testing.T) {
 	if err := st.PauseSubscription(ctx, s2, u2); err != nil {
 		t.Fatal(err)
 	}
-	products, err = st.AllActiveProducts(ctx)
-	if err != nil || len(products) != 0 {
-		t.Fatalf("paused product still active: %+v %v", products, err)
+	if err = db.QueryRow(ctx, `SELECT COUNT(DISTINCT product_id) FROM subscriptions WHERE active AND NOT paused`).Scan(&activeProducts); err != nil || activeProducts != 0 {
+		t.Fatalf("paused product still active: %d %v", activeProducts, err)
 	}
 }
 
 func TestPriceHistoryRetentionIntegration(t *testing.T) {
-	st, _ := integrationStore(t)
+	st, db := integrationStore(t)
 	_, product := seedProduct(t, st)
 	ctx := t.Context()
 	now := time.Now().UTC().Truncate(time.Second)
@@ -267,7 +263,7 @@ func TestPriceHistoryRetentionIntegration(t *testing.T) {
 		price float64
 		at    time.Time
 	}{{99, now.Add(-100 * 24 * time.Hour)}, {110, now.Add(-time.Hour)}, {120.50, now}} {
-		if err := st.SavePrice(ctx, product, point.price, "RUB", point.at); err != nil {
+		if _, err := db.Exec(ctx, `INSERT INTO price_history(product_id,price,currency,scraped_at) VALUES($1,$2,'RUB',$3)`, product, point.price, point.at); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -282,7 +278,7 @@ func TestPriceHistoryRetentionIntegration(t *testing.T) {
 	if err != nil || len(points) != 2 {
 		t.Fatalf("retained history=%+v err=%v", points, err)
 	}
-	if err := st.SavePrice(ctx, uuid.NewString(), 1, "RUB", now); err == nil {
+	if _, err := db.Exec(ctx, `INSERT INTO price_history(product_id,price,currency,scraped_at) VALUES($1,1,'RUB',$2)`, uuid.NewString(), now); err == nil {
 		t.Fatal("history accepted nonexistent product")
 	}
 }

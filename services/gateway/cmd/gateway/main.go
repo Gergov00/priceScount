@@ -13,13 +13,13 @@ import (
 	"go.uber.org/fx"
 	"go.uber.org/fx/fxevent"
 
-	"github.com/Gergov00/pricescount/shared/pkg/broker"
-	"github.com/Gergov00/pricescount/shared/pkg/contracts"
 	"github.com/Gergov00/pricescount/services/gateway/internal/cleaner"
 	"github.com/Gergov00/pricescount/services/gateway/internal/config"
 	"github.com/Gergov00/pricescount/services/gateway/internal/consumer"
 	"github.com/Gergov00/pricescount/services/gateway/internal/handler"
 	"github.com/Gergov00/pricescount/services/gateway/internal/store"
+	"github.com/Gergov00/pricescount/shared/pkg/broker"
+	"github.com/Gergov00/pricescount/shared/pkg/outbox"
 )
 
 func main() {
@@ -34,13 +34,15 @@ func main() {
 			store.New,
 			newHandler,
 			newConsumer,
+			newOutboxWorker,
 			newRouter,
 		),
 		fx.Invoke(
 			runHTTP,
 			runConsumer,
 			runCleaner,
-			resyncScheduler,
+			runOutbox,
+			runReconciliation,
 		),
 	).Run()
 }
@@ -80,8 +82,12 @@ func newBroker(lc fx.Lifecycle, cfg *config.Config) (*broker.Connection, error) 
 	return conn, nil
 }
 
-func newHandler(st *store.Store, mq *broker.Connection) *handler.Handler {
-	return handler.New(st, mq)
+func newHandler(st *store.Store) *handler.Handler {
+	return handler.New(st)
+}
+
+func newOutboxWorker(st *store.Store, mq *broker.Connection) *outbox.Worker {
+	return outbox.New(st, mq)
 }
 
 func newConsumer(mq *broker.Connection, st *store.Store) *consumer.Consumer {
@@ -128,61 +134,114 @@ func runHTTP(lc fx.Lifecycle, r *gin.Engine, cfg *config.Config, s fx.Shutdowner
 
 func runConsumer(lc fx.Lifecycle, c *consumer.Consumer, s fx.Shutdowner) {
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 	lc.Append(fx.Hook{
 		OnStart: func(_ context.Context) error {
 			go func() {
+				defer close(done)
 				if err := c.Run(ctx); err != nil {
-					slog.Error("consumer stopped", "error", err)
-					s.Shutdown(fx.ExitCode(1))
+					if ctx.Err() == nil {
+						slog.Error("consumer stopped", "error", err)
+						s.Shutdown(fx.ExitCode(1))
+					}
 				}
 			}()
 			return nil
 		},
-		OnStop: func(_ context.Context) error {
+		OnStop: func(stopCtx context.Context) error {
 			cancel()
-			return nil
+			select {
+			case <-done:
+				return nil
+			case <-stopCtx.Done():
+				return stopCtx.Err()
+			}
 		},
 	})
 }
 
 func runCleaner(lc fx.Lifecycle, st *store.Store) {
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 	lc.Append(fx.Hook{
 		OnStart: func(_ context.Context) error {
-			go cleaner.Run(ctx, st, 5*time.Minute, 90*24*time.Hour)
+			go func() { defer close(done); cleaner.Run(ctx, st, 5*time.Minute, 90*24*time.Hour) }()
 			return nil
 		},
-		OnStop: func(_ context.Context) error {
+		OnStop: func(stopCtx context.Context) error {
 			cancel()
-			return nil
+			select {
+			case <-done:
+				return nil
+			case <-stopCtx.Done():
+				return stopCtx.Err()
+			}
 		},
 	})
 }
 
-// resyncScheduler publishes track.requests{add} for every active product on startup
-// so the scheduler's scheduled_urls table is always consistent with gateway's subscriptions.
-func resyncScheduler(lc fx.Lifecycle, st *store.Store, mq *broker.Connection) {
-	lc.Append(fx.Hook{
-		OnStart: func(ctx context.Context) error {
-			products, err := st.AllActiveProducts(ctx)
-			if err != nil {
-				slog.Error("resync scheduler: fetch products", "error", err)
-				return nil // non-fatal: scheduler will pick things up eventually
+func runOutbox(lc fx.Lifecycle, worker *outbox.Worker, s fx.Shutdowner) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	lc.Append(fx.Hook{OnStart: func(context.Context) error {
+		go func() {
+			defer close(done)
+			if err := worker.Run(ctx); err != nil && ctx.Err() == nil {
+				slog.Error("outbox worker stopped", "error", err)
+				s.Shutdown(fx.ExitCode(1))
 			}
-			for _, p := range products {
-				msg := contracts.TrackRequest{
-					Action:        "add",
-					ProductID:     p.ProductID,
-					URL:           p.URL,
-					Platform:      p.Platform,
-					IntervalHours: 1,
-				}
-				if err := mq.Publish(ctx, broker.QueueTrackRequests, msg); err != nil {
-					slog.Error("resync scheduler: publish", "url", p.URL, "error", err)
-				}
-			}
-			slog.Info("scheduler resync complete", "products", len(products))
+		}()
+		return nil
+	}, OnStop: func(stopCtx context.Context) error {
+		cancel()
+		select {
+		case <-done:
 			return nil
+		case <-stopCtx.Done():
+			return stopCtx.Err()
+		}
+	}})
+}
+
+func runReconciliation(lc fx.Lifecycle, st *store.Store) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	lc.Append(fx.Hook{
+		OnStart: func(context.Context) error {
+			go func() {
+				defer close(done)
+				retryDelay := time.Second
+				for {
+					delay := 5 * time.Minute
+					if err := st.ReconcileMonitoring(ctx); err != nil && ctx.Err() == nil {
+						slog.Error("monitor reconciliation failed", "error", err)
+						delay = retryDelay
+						retryDelay *= 2
+						if retryDelay > time.Minute {
+							retryDelay = time.Minute
+						}
+					} else {
+						retryDelay = time.Second
+					}
+					timer := time.NewTimer(delay)
+					select {
+					case <-ctx.Done():
+						timer.Stop()
+						return
+					case <-timer.C:
+					}
+				}
+			}()
+			return nil
+		},
+		OnStop: func(stopCtx context.Context) error {
+			cancel()
+			select {
+			case <-done:
+				return nil
+			case <-stopCtx.Done():
+				return stopCtx.Err()
+			}
 		},
 	})
 }

@@ -40,7 +40,10 @@ type PriceResult struct {
 
 // TrackRequest is published to the track.requests queue to manage scheduled monitoring.
 type TrackRequest struct {
-	Action        string `json:"action"`                   // add | pause | resume | delete | force
+	TaskID        string `json:"task_id"`
+	Action        string `json:"action"` // add | pause | resume | delete | force
+	Version       int64  `json:"version,omitempty"`
+	Active        bool   `json:"active"`
 	ProductID     string `json:"product_id"`
 	URL           string `json:"url"`
 	Platform      string `json:"platform"`
@@ -50,8 +53,9 @@ type TrackRequest struct {
 
 // NotifyTask is published to the notify.tasks queue for delivery to the user.
 type NotifyTask struct {
-	Channel   string `json:"channel"`             // telegram | email | push
-	Target    string `json:"target"`              // chat_id (as string), email, device token
+	TaskID    string `json:"task_id"`
+	Channel   string `json:"channel"` // telegram | email | push
+	Target    string `json:"target"`  // chat_id (as string), email, device token
 	Text      string `json:"text"`
 	Direction string `json:"direction,omitempty"` // up | down
 }
