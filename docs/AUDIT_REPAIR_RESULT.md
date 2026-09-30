@@ -25,9 +25,11 @@ Task 6 adds Fx lifecycle checks in Gateway, Scheduler, Extractor, Bot, and Notif
 
 Deployment documentation now explains RabbitMQ's stable hostname/nodename requirement and preservation of existing anonymous-volume data. Mnesia data must retain the actual old node name and compatible version; definitions export/import does not preserve queued message bodies. README cutover steps halt ingress/new ticks, drain `track.requests` with the old Scheduler, then keep old Gateway/Extractor/Notifier consumers active while dependent queues drain; migration is additive and transactional, and outbox/queue health is checked before deleting old recovery evidence. No production cutover was run.
 
+Follow-up from independent Task 6 review: `RABBITMQ_HOSTNAME`, `RABBITMQ_NODENAME`, and `RABBITMQ_USE_LONGNAME` are now configurable, with stable fresh-install defaults and explicit restoration instructions requiring the recorded hostname and exact nodename. `docker compose config` was validated against a minimal isolated fixture using defaults and fake legacy identity overrides; no service was started. The root `./...` evidence wording was corrected to list all six module paths explicitly.
+
 ## Verification on 2026-10-01
 
-- All six Go modules: `go test -race -count=1 -timeout=120s ./...` passed.
+- All six Go modules: `go test -race -count=1 -timeout=120s ./services/bot/... ./services/gateway/... ./services/scheduler/... ./services/extractor/... ./services/notifier/... ./shared/...` passed. The workspace root does not traverse these modules with `./...`.
 - `scripts/test-integration.ps1 -Coverage` passed on isolated PostgreSQL 16/RabbitMQ 3.13 project `pricescount-tests-7c21802065b4`; statement coverage was 55.6%. The runner removed its project.
 - `scripts/test-integration.ps1 -Regression` passed on isolated project `pricescount-tests-02b1edaaf331`; the runner removed its project.
 - Controller independently confirmed all-six integration/regression race tests, `go build`, and `go vet`; after the last helper-only change, `shared` race and vet passed again.
