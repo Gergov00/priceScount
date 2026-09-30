@@ -77,6 +77,26 @@ func TestPublishMarshalErrorDoesNotEnqueue(t *testing.T) {
 	}
 }
 
+func TestPublishUnroutableFails(t *testing.T) {
+	t.Parallel()
+	connection := newIntegrationConnection(t, rabbitMQURL(t))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := connection.Publish(ctx, uniqueIntegrationQueue("missing"), map[string]string{"id": "unroutable"}); err == nil {
+		t.Fatal("Publish() error = nil for an unroutable mandatory message")
+	}
+}
+
+func TestPublishCancelled(t *testing.T) {
+	t.Parallel()
+	connection := newIntegrationConnection(t, rabbitMQURL(t))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := connection.Publish(ctx, uniqueIntegrationQueue("cancelled"), map[string]string{"id": "cancelled"}); err == nil {
+		t.Fatal("Publish() error = nil for cancelled context")
+	}
+}
+
 func TestPublishReconnectsAfterPublisherChannelCloses(t *testing.T) {
 	t.Parallel()
 	url := rabbitMQURL(t)
@@ -84,7 +104,10 @@ func TestPublishReconnectsAfterPublisherChannelCloses(t *testing.T) {
 	connection := newIntegrationConnection(t, url)
 	declareIntegrationQueue(t, connection, queue)
 
-	if err := connection.ch.Close(); err != nil {
+	connection.mu.Lock()
+	publisher := connection.publishCh
+	connection.mu.Unlock()
+	if err := publisher.Close(); err != nil {
 		t.Fatalf("close publisher channel: %v", err)
 	}
 	want := map[string]string{"task_id": "after-reconnect"}

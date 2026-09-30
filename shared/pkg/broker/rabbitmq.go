@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 	"time"
 
@@ -17,27 +18,33 @@ const (
 	QueuePriceResults  = "price.results"
 	QueueTrackRequests = "track.requests"
 	QueueNotifyTasks   = "notify.tasks"
+	dialTimeout        = 5 * time.Second
 )
 
-// Connection wraps an AMQP connection and a default channel.
-// Publish transparently redials once if the connection or channel has died;
-// consumers are not redialed — a closed delivery channel is expected to
-// terminate the service so the supervisor (docker restart) re-establishes it.
+// Connection owns independent consumer and publisher channels. Publishing is
+// serialized because confirm and return notifications are channel-scoped.
 type Connection struct {
-	url string
-
-	mu   sync.Mutex // guards conn/ch replacement during redial
-	conn *amqp.Connection
-	ch   *amqp.Channel
+	url         string
+	mu          sync.Mutex
+	conn        *amqp.Connection
+	pubConn     *amqp.Connection
+	pubNetConn  net.Conn
+	ch          *amqp.Channel
+	publishGate chan struct{}
+	publishCh   *amqp.Channel
+	confirms    <-chan amqp.Confirmation
+	returns     <-chan amqp.Return
+	closed      bool
 }
 
-// NewConnection dials RabbitMQ and opens a default channel with prefetch=10.
 func NewConnection(rawURL string) (*Connection, error) {
-	c := &Connection{url: rawURL}
-	return c, c.dial()
+	c := &Connection{url: rawURL, publishGate: make(chan struct{}, 1)}
+	if err := c.dial(); err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
-// ConnectWithRetry calls NewConnection up to maxAttempts times with linear backoff.
 func ConnectWithRetry(rawURL string, maxAttempts int) (*Connection, error) {
 	var lastErr error
 	for i := 1; i <= maxAttempts; i++ {
@@ -53,111 +60,285 @@ func ConnectWithRetry(rawURL string, maxAttempts int) (*Connection, error) {
 	return nil, fmt.Errorf("rabbitmq: failed after %d attempts: %w", maxAttempts, lastErr)
 }
 
+func dialRabbit(url string) (*amqp.Connection, error) {
+	config := amqp.Config{Dial: func(network, addr string) (net.Conn, error) { return net.DialTimeout(network, addr, dialTimeout) }}
+	return amqp.DialConfig(url, config)
+}
+
 func (c *Connection) dial() error {
-	conn, err := amqp.Dial(c.url)
+	conn, err := dialRabbit(c.url)
 	if err != nil {
 		return fmt.Errorf("amqp dial: %w", err)
 	}
-	ch, err := conn.Channel()
+	consumer, err := conn.Channel()
 	if err != nil {
 		conn.Close()
-		return fmt.Errorf("open channel: %w", err)
+		return fmt.Errorf("open consumer channel: %w", err)
 	}
-	if err := ch.Qos(10, 0, false); err != nil {
-		ch.Close()
+	if err := consumer.Qos(10, 0, false); err != nil {
+		consumer.Close()
 		conn.Close()
 		return fmt.Errorf("qos: %w", err)
 	}
-	c.conn = conn
-	c.ch = ch
+	pubConn, publisher, err := c.openPublisher()
+	if err != nil {
+		consumer.Close()
+		conn.Close()
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		publisher.Close()
+		consumer.Close()
+		conn.Close()
+		return fmt.Errorf("rabbitmq connection is closed")
+	}
+	c.conn, c.ch, c.pubConn, c.publishCh = conn, consumer, pubConn, publisher
 	return nil
 }
 
-// DeclareQueue declares a durable, non-auto-delete queue.
+func (c *Connection) openPublisher() (*amqp.Connection, *amqp.Channel, error) {
+	var netConn net.Conn
+	config := amqp.Config{Dial: func(network, addr string) (net.Conn, error) {
+		conn, err := net.DialTimeout(network, addr, dialTimeout)
+		if err == nil {
+			netConn = conn
+		}
+		return conn, err
+	}}
+	conn, err := amqp.DialConfig(c.url, config)
+	if err != nil {
+		return nil, nil, fmt.Errorf("publisher amqp dial: %w", err)
+	}
+	c.mu.Lock()
+	c.pubNetConn = netConn
+	c.mu.Unlock()
+	ch, err := conn.Channel()
+	if err != nil {
+		conn.Close()
+		return nil, nil, fmt.Errorf("open publisher channel: %w", err)
+	}
+	if err := ch.Confirm(false); err != nil {
+		ch.Close()
+		conn.Close()
+		return nil, nil, fmt.Errorf("enable publisher confirms: %w", err)
+	}
+	c.mu.Lock()
+	c.confirms = ch.NotifyPublish(make(chan amqp.Confirmation, 1))
+	c.returns = ch.NotifyReturn(make(chan amqp.Return, 1))
+	c.mu.Unlock()
+	return conn, ch, nil
+}
+
 func (c *Connection) DeclareQueue(name string) error {
-	_, err := c.ch.QueueDeclare(name, true, false, false, false, nil)
+	c.mu.Lock()
+	ch := c.ch
+	c.mu.Unlock()
+	if ch == nil {
+		return fmt.Errorf("rabbitmq consumer channel unavailable")
+	}
+	_, err := ch.QueueDeclare(name, true, false, false, false, nil)
 	return err
 }
 
-// Publish JSON-encodes v and publishes it as a persistent message to queue.
-// If the underlying connection has died it redials once and retries.
 func (c *Connection) Publish(ctx context.Context, queue string, v any) error {
 	body, err := json.Marshal(v)
 	if err != nil {
 		return fmt.Errorf("json marshal: %w", err)
 	}
-	msg := amqp.Publishing{
-		ContentType:  "application/json",
-		DeliveryMode: amqp.Persistent,
-		Body:         body,
-	}
-
-	if err := c.publishOn(ctx, queue, msg); err == nil {
+	msg := amqp.Publishing{ContentType: "application/json", DeliveryMode: amqp.Persistent, Body: body}
+	err = c.publishOn(ctx, queue, msg)
+	if err == nil {
 		return nil
-	} else if !c.isDead() {
+	}
+	if ctx.Err() != nil || !c.isDead() {
 		return err
 	}
-
-	if err := c.redial(); err != nil {
+	if err := c.redial(ctx); err != nil {
 		return fmt.Errorf("publish redial: %w", err)
 	}
 	return c.publishOn(ctx, queue, msg)
 }
 
 func (c *Connection) publishOn(ctx context.Context, queue string, msg amqp.Publishing) error {
+	// The mutex protects only the publisher channel and its notification streams;
+	// consumer channel reads and Close never wait for an outstanding confirm.
+	select {
+	case c.publishGate <- struct{}{}:
+		defer func() { <-c.publishGate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	c.mu.Lock()
-	ch := c.ch
+	ch := c.publishCh
+	closed := c.closed
 	c.mu.Unlock()
-	return ch.PublishWithContext(ctx, "", queue, false, false, msg)
+	if closed || ch == nil || ch.IsClosed() {
+		return fmt.Errorf("publisher channel unavailable")
+	}
+	c.mu.Lock()
+	confirms, returns := c.confirms, c.returns
+	c.mu.Unlock()
+	stopDeadline, err := c.setPublishDeadline(ctx)
+	if err != nil {
+		c.retirePublisher(ch)
+		return fmt.Errorf("set publish deadline: %w", err)
+	}
+	if err := ch.PublishWithContext(ctx, "", queue, true, false, msg); err != nil {
+		stopDeadline()
+		c.retirePublisher(ch)
+		return fmt.Errorf("publish: %w", err)
+	}
+	stopDeadline()
+	_ = setWriteDeadline(c.publisherNetConn(), time.Time{})
+	var returned *amqp.Return
+	for {
+		select {
+		case ret, ok := <-returns:
+			if ok {
+				returned = &ret
+				returns = nil
+				continue
+			}
+			returns = nil
+		case confirm, ok := <-confirms:
+			if !ok {
+				return fmt.Errorf("publisher confirm channel closed")
+			}
+			if returned != nil {
+				return fmt.Errorf("message unroutable to %q: %s", queue, returned.ReplyText)
+			}
+			if !confirm.Ack {
+				return fmt.Errorf("publish to %q negatively acknowledged", queue)
+			}
+			return nil
+		case <-ctx.Done():
+			c.retirePublisher(ch)
+			return ctx.Err()
+		}
+	}
+}
+
+func setWriteDeadline(conn net.Conn, deadline time.Time) error {
+	if conn == nil {
+		return nil
+	}
+	return conn.SetWriteDeadline(deadline)
+}
+
+func (c *Connection) publisherNetConn() net.Conn {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pubNetConn
+}
+
+func (c *Connection) setPublishDeadline(ctx context.Context) (func() bool, error) {
+	conn := c.publisherNetConn()
+	if conn == nil {
+		return nil, fmt.Errorf("publisher transport unavailable")
+	}
+	deadline := time.Now().Add(dialTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	if err := conn.SetWriteDeadline(deadline); err != nil {
+		return nil, err
+	}
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { defer close(done); _ = conn.SetWriteDeadline(time.Now()) })
+	return func() bool {
+		stopped := stop()
+		if !stopped {
+			<-done
+		}
+		return stopped
+	}, nil
+}
+
+func (c *Connection) retirePublisher(ch *amqp.Channel) {
+	c.mu.Lock()
+	var conn *amqp.Connection
+	if c.publishCh == ch {
+		c.publishCh, c.confirms, c.returns = nil, nil, nil
+		conn, c.pubConn = c.pubConn, nil
+		c.pubNetConn = nil
+	}
+	c.mu.Unlock()
+	_ = ch.Close()
+	if conn != nil {
+		_ = conn.Close()
+	}
 }
 
 func (c *Connection) isDead() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.conn == nil || c.conn.IsClosed() || c.ch.IsClosed()
+	return c.closed || c.pubConn == nil || c.pubConn.IsClosed() || c.publishCh == nil || c.publishCh.IsClosed()
 }
 
-// redial re-establishes the connection and default channel after a drop.
-func (c *Connection) redial() error {
+func (c *Connection) redial(ctx context.Context) error {
+	select {
+	case c.publishGate <- struct{}{}:
+		defer func() { <-c.publishGate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	slog.Warn("rabbitmq publisher connection lost, redialing")
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.conn != nil && !c.conn.IsClosed() && !c.ch.IsClosed() {
-		return nil // another goroutine already redialed
+	if c.closed {
+		c.mu.Unlock()
+		return fmt.Errorf("rabbitmq connection is closed")
 	}
-	if c.conn != nil {
-		c.conn.Close()
+	if c.pubConn != nil && !c.pubConn.IsClosed() && c.publishCh != nil && !c.publishCh.IsClosed() {
+		c.mu.Unlock()
+		return nil
 	}
-	slog.Warn("rabbitmq connection lost, redialing")
-	conn, err := amqp.Dial(c.url)
+	old := c.pubConn
+	c.mu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	pubConn, publisher, err := c.openPublisher()
 	if err != nil {
-		return fmt.Errorf("amqp dial: %w", err)
+		return err
 	}
-	ch, err := conn.Channel()
-	if err != nil {
-		conn.Close()
-		return fmt.Errorf("open channel: %w", err)
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		publisher.Close()
+		pubConn.Close()
+		return fmt.Errorf("rabbitmq connection is closed")
 	}
-	if err := ch.Qos(10, 0, false); err != nil {
-		ch.Close()
-		conn.Close()
-		return fmt.Errorf("qos: %w", err)
-	}
-	c.conn = conn
-	c.ch = ch
+	c.pubConn, c.publishCh = pubConn, publisher
+	c.mu.Unlock()
 	return nil
 }
 
-// Consume registers a consumer on queue using the default channel (prefetch=10).
-// Messages must be acked/nacked by the caller.
 func (c *Connection) Consume(queue, consumer string) (<-chan amqp.Delivery, error) {
-	return c.ch.Consume(queue, consumer, false, false, false, false, nil)
+	c.mu.Lock()
+	ch := c.ch
+	c.mu.Unlock()
+	if ch == nil {
+		return nil, fmt.Errorf("consumer channel unavailable")
+	}
+	return ch.Consume(queue, consumer, false, false, false, false, nil)
 }
 
-// ConsumeWithPrefetch opens a dedicated channel with the given prefetch count and
-// registers a consumer. Use this when different consumers need different prefetch
-// values (e.g. lookup.tasks prefetch=1, scraper.tasks prefetch=2).
 func (c *Connection) ConsumeWithPrefetch(queue, consumer string, prefetch int) (<-chan amqp.Delivery, error) {
-	ch, err := c.conn.Channel()
+	c.mu.Lock()
+	conn := c.conn
+	closed := c.closed
+	c.mu.Unlock()
+	if closed || conn == nil {
+		return nil, fmt.Errorf("connection unavailable")
+	}
+	ch, err := conn.Channel()
 	if err != nil {
 		return nil, fmt.Errorf("open channel for %s: %w", queue, err)
 	}
@@ -178,10 +359,26 @@ func (c *Connection) ConsumeWithPrefetch(queue, consumer string, prefetch int) (
 }
 
 func (c *Connection) Close() {
-	if c.ch != nil {
-		c.ch.Close()
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
 	}
-	if c.conn != nil {
-		c.conn.Close()
+	c.closed = true
+	conn, pubConn, ch, pub := c.conn, c.pubConn, c.ch, c.publishCh
+	c.mu.Unlock()
+	// Closing the connection wakes pending publisher confirms without taking
+	// publishMu, so shutdown cannot queue behind a caller's context timeout.
+	if ch != nil {
+		_ = ch.Close()
+	}
+	if pub != nil {
+		_ = pub.Close()
+	}
+	if pubConn != nil {
+		_ = pubConn.Close()
+	}
+	if conn != nil {
+		_ = conn.Close()
 	}
 }
