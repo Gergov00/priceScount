@@ -19,6 +19,7 @@ const (
 	QueueTrackRequests = "track.requests"
 	QueueNotifyTasks   = "notify.tasks"
 	dialTimeout        = 5 * time.Second
+	closeTimeout       = time.Second
 )
 
 // Connection owns independent consumer and publisher channels. Publishing is
@@ -80,7 +81,7 @@ func (c *Connection) dial() error {
 		conn.Close()
 		return fmt.Errorf("qos: %w", err)
 	}
-	pubConn, publisher, err := c.openPublisher()
+	pubConn, publisher, err := c.openPublisher(context.Background())
 	if err != nil {
 		consumer.Close()
 		conn.Close()
@@ -98,12 +99,50 @@ func (c *Connection) dial() error {
 	return nil
 }
 
-func (c *Connection) openPublisher() (*amqp.Connection, *amqp.Channel, error) {
+func (c *Connection) openPublisher(ctx context.Context) (*amqp.Connection, *amqp.Channel, error) {
 	var netConn net.Conn
+	var netMu sync.Mutex
+	var setupTimer *time.Timer
+	var timerDone chan struct{}
+	closed := make(chan struct{})
+	stopCancel := context.AfterFunc(ctx, func() {
+		netMu.Lock()
+		defer netMu.Unlock()
+		if netConn != nil {
+			_ = netConn.Close()
+		}
+		close(closed)
+	})
+	setupFinished := false
+	finishSetup := func() bool {
+		cancelStopped := stopCancel()
+		if !cancelStopped {
+			<-closed
+		}
+		timerStopped := true
+		if setupTimer != nil {
+			timerStopped = setupTimer.Stop()
+			if !timerStopped {
+				<-timerDone
+			}
+		}
+		setupFinished = true
+		return cancelStopped && timerStopped && ctx.Err() == nil
+	}
+	defer func() {
+		if !setupFinished {
+			_ = finishSetup()
+		}
+	}()
 	config := amqp.Config{Dial: func(network, addr string) (net.Conn, error) {
-		conn, err := net.DialTimeout(network, addr, dialTimeout)
+		conn, err := (&net.Dialer{Timeout: dialTimeout}).DialContext(ctx, network, addr)
 		if err == nil {
+			netMu.Lock()
 			netConn = conn
+			_ = conn.SetDeadline(time.Now().Add(dialTimeout))
+			timerDone = make(chan struct{})
+			setupTimer = time.AfterFunc(dialTimeout, func() { defer close(timerDone); _ = conn.Close() })
+			netMu.Unlock()
 		}
 		return conn, err
 	}}
@@ -111,19 +150,43 @@ func (c *Connection) openPublisher() (*amqp.Connection, *amqp.Channel, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("publisher amqp dial: %w", err)
 	}
+	if err := setupDeadline(ctx, netConn); err != nil {
+		_ = netConn.Close()
+		return nil, nil, err
+	}
 	c.mu.Lock()
 	c.pubNetConn = netConn
 	c.mu.Unlock()
 	ch, err := conn.Channel()
 	if err != nil {
-		conn.Close()
+		_ = netConn.Close()
+		_ = conn.CloseDeadline(time.Now().Add(closeTimeout))
 		return nil, nil, fmt.Errorf("open publisher channel: %w", err)
 	}
+	if err := setupDeadline(ctx, netConn); err != nil {
+		_ = netConn.Close()
+		_ = conn.CloseDeadline(time.Now().Add(closeTimeout))
+		return nil, nil, err
+	}
 	if err := ch.Confirm(false); err != nil {
-		ch.Close()
-		conn.Close()
+		_ = netConn.Close()
+		_ = conn.CloseDeadline(time.Now().Add(closeTimeout))
 		return nil, nil, fmt.Errorf("enable publisher confirms: %w", err)
 	}
+	if err := setupDeadline(ctx, netConn); err != nil {
+		_ = netConn.Close()
+		_ = conn.CloseDeadline(time.Now().Add(closeTimeout))
+		return nil, nil, err
+	}
+	if !finishSetup() {
+		_ = netConn.Close()
+		_ = conn.CloseDeadline(time.Now().Add(closeTimeout))
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		return nil, nil, fmt.Errorf("publisher AMQP setup timed out")
+	}
+	_ = netConn.SetDeadline(time.Time{})
 	c.mu.Lock()
 	c.confirms = ch.NotifyPublish(make(chan amqp.Confirmation, 1))
 	c.returns = ch.NotifyReturn(make(chan amqp.Return, 1))
@@ -192,6 +255,14 @@ func (c *Connection) publishOn(ctx context.Context, queue string, msg amqp.Publi
 	}
 	stopDeadline()
 	_ = setWriteDeadline(c.publisherNetConn(), time.Time{})
+	err = awaitConfirm(ctx, queue, returns, confirms)
+	if ctx.Err() != nil {
+		c.retirePublisher(ch)
+	}
+	return err
+}
+
+func awaitConfirm(ctx context.Context, queue string, returns <-chan amqp.Return, confirms <-chan amqp.Confirmation) error {
 	var returned *amqp.Return
 	for {
 		select {
@@ -206,6 +277,15 @@ func (c *Connection) publishOn(ctx context.Context, queue string, msg amqp.Publi
 			if !ok {
 				return fmt.Errorf("publisher confirm channel closed")
 			}
+			if returned == nil {
+				select {
+				case ret, ok := <-returns:
+					if ok {
+						returned = &ret
+					}
+				default:
+				}
+			}
 			if returned != nil {
 				return fmt.Errorf("message unroutable to %q: %s", queue, returned.ReplyText)
 			}
@@ -214,7 +294,6 @@ func (c *Connection) publishOn(ctx context.Context, queue string, msg amqp.Publi
 			}
 			return nil
 		case <-ctx.Done():
-			c.retirePublisher(ch)
 			return ctx.Err()
 		}
 	}
@@ -225,6 +304,23 @@ func setWriteDeadline(conn net.Conn, deadline time.Time) error {
 		return nil
 	}
 	return conn.SetWriteDeadline(deadline)
+}
+
+func setupDeadline(ctx context.Context, conn net.Conn) error {
+	if conn == nil {
+		return fmt.Errorf("publisher transport unavailable")
+	}
+	deadline := time.Now().Add(dialTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (c *Connection) publisherNetConn() net.Conn {
@@ -259,15 +355,18 @@ func (c *Connection) setPublishDeadline(ctx context.Context) (func() bool, error
 func (c *Connection) retirePublisher(ch *amqp.Channel) {
 	c.mu.Lock()
 	var conn *amqp.Connection
+	var socket net.Conn
 	if c.publishCh == ch {
 		c.publishCh, c.confirms, c.returns = nil, nil, nil
 		conn, c.pubConn = c.pubConn, nil
-		c.pubNetConn = nil
+		socket, c.pubNetConn = c.pubNetConn, nil
 	}
 	c.mu.Unlock()
-	_ = ch.Close()
+	if socket != nil {
+		_ = socket.Close()
+	}
 	if conn != nil {
-		_ = conn.Close()
+		_ = conn.CloseDeadline(time.Now().Add(closeTimeout))
 	}
 }
 
@@ -294,25 +393,32 @@ func (c *Connection) redial(ctx context.Context) error {
 		c.mu.Unlock()
 		return nil
 	}
-	old := c.pubConn
+	old, oldSocket := c.pubConn, c.pubNetConn
+	c.pubConn, c.publishCh, c.confirms, c.returns, c.pubNetConn = nil, nil, nil, nil, nil
 	c.mu.Unlock()
+	if oldSocket != nil {
+		_ = oldSocket.Close()
+	}
 	if old != nil {
-		_ = old.Close()
+		_ = old.CloseDeadline(time.Now().Add(closeTimeout))
 	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
 	}
-	pubConn, publisher, err := c.openPublisher()
+	pubConn, publisher, err := c.openPublisher(ctx)
 	if err != nil {
 		return err
 	}
 	c.mu.Lock()
 	if c.closed {
+		socket := c.pubNetConn
 		c.mu.Unlock()
-		publisher.Close()
-		pubConn.Close()
+		if socket != nil {
+			_ = socket.Close()
+		}
+		_ = pubConn.CloseDeadline(time.Now().Add(closeTimeout))
 		return fmt.Errorf("rabbitmq connection is closed")
 	}
 	c.pubConn, c.publishCh = pubConn, publisher
@@ -365,20 +471,18 @@ func (c *Connection) Close() {
 		return
 	}
 	c.closed = true
-	conn, pubConn, ch, pub := c.conn, c.pubConn, c.ch, c.publishCh
+	conn, pubConn, socket := c.conn, c.pubConn, c.pubNetConn
+	c.pubConn, c.publishCh, c.confirms, c.returns, c.pubNetConn = nil, nil, nil, nil, nil
 	c.mu.Unlock()
-	// Closing the connection wakes pending publisher confirms without taking
-	// publishMu, so shutdown cannot queue behind a caller's context timeout.
-	if ch != nil {
-		_ = ch.Close()
-	}
-	if pub != nil {
-		_ = pub.Close()
+	// Force-close transports before bounded AMQP close handshakes so no close
+	// waits behind a peer that stopped reading or responding.
+	if socket != nil {
+		_ = socket.Close()
 	}
 	if pubConn != nil {
-		_ = pubConn.Close()
+		_ = pubConn.CloseDeadline(time.Now().Add(closeTimeout))
 	}
 	if conn != nil {
-		_ = conn.Close()
+		_ = conn.CloseDeadline(time.Now().Add(closeTimeout))
 	}
 }
