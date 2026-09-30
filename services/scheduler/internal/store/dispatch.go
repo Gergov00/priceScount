@@ -27,6 +27,16 @@ func validWBIdentity(rawURL, platform string) bool {
 	return err == nil && normalized == rawURL
 }
 
+func lockProductIdentity(ctx context.Context, tx pgx.Tx, productID string) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "scheduler-product:"+productID)
+	return err
+}
+
+func lockURLIdentity(ctx context.Context, tx pgx.Tx, rawURL string) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "scheduler-url:"+rawURL)
+	return err
+}
+
 // ApplySnapshot applies a strictly newer product monitoring state and keeps inactive tombstones.
 func (s *Store) ApplySnapshot(ctx context.Context, request contracts.TrackRequest) error {
 	if request.Action != "set_state" || request.Version <= 0 || request.IntervalHours <= 0 {
@@ -48,8 +58,11 @@ func (s *Store) ApplySnapshot(ctx context.Context, request contracts.TrackReques
 	}
 	// Rollback releases the advisory lock and cleans up partial work on error paths.
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, productID.String()); err != nil {
+	if err := lockProductIdentity(ctx, tx, productID.String()); err != nil {
 		return fmt.Errorf("lock snapshot product: %w", err)
+	}
+	if err := lockURLIdentity(ctx, tx, request.URL); err != nil {
+		return fmt.Errorf("lock snapshot URL: %w", err)
 	}
 	var existingURL string
 	err = tx.QueryRow(ctx, `SELECT url FROM scheduled_urls WHERE product_id=$1 FOR UPDATE`, productID).Scan(&existingURL)
@@ -160,8 +173,11 @@ func (s *Store) EnqueueForce(ctx context.Context, request contracts.TrackRequest
 	}
 	// Rollback releases the transaction-scoped advisory lock and discards partial work on errors.
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, productID.String()); err != nil {
+	if err := lockProductIdentity(ctx, tx, productID.String()); err != nil {
 		return fmt.Errorf("lock force product identity: %w", err)
+	}
+	if err := lockURLIdentity(ctx, tx, request.URL); err != nil {
+		return fmt.Errorf("lock force URL identity: %w", err)
 	}
 	var actualURL string
 	productErr := tx.QueryRow(ctx, `SELECT url FROM scheduled_urls WHERE product_id=$1 FOR SHARE`, productID).Scan(&actualURL)

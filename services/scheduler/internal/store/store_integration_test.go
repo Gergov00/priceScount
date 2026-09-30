@@ -174,6 +174,69 @@ func TestForceProductURLMismatchDoesNotConsumeTaskID(t *testing.T) {
 		t.Fatalf("valid retry was not persisted once: processed=%d events=%d", processed, events)
 	}
 }
+
+func TestForceWaitsForConcurrentURLClaim(t *testing.T) {
+	st, db := integrationStore(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	claimedProduct, forceProduct := uuid.NewString(), uuid.NewString()
+	url, taskID := "https://www.wildberries.ru/catalog/116/detail.aspx", uuid.NewString()
+	lockTx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lockURLIdentity(ctx, lockTx, url); err != nil {
+		t.Fatal(err)
+	}
+	type snapshotResult struct{ err error }
+	snapshotDone := make(chan snapshotResult, 1)
+	go func() {
+		snapshotDone <- snapshotResult{err: st.ApplySnapshot(ctx, snapshot(claimedProduct, url, 1, true))}
+	}()
+	waitForAdvisoryWaiters(t, db, ctx, 1)
+	forceDone := make(chan error, 1)
+	go func() { forceDone <- st.EnqueueForce(ctx, force(forceProduct, taskID, url)) }()
+	waitForAdvisoryWaiters(t, db, ctx, 2)
+	if err := lockTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if result := <-snapshotDone; result.err != nil {
+		t.Fatalf("snapshot URL claim: %v", result.err)
+	}
+	if err := <-forceDone; !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("force URL race error=%v", err)
+	}
+	var processed, events int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM processed_force_commands WHERE task_id=$1`, taskID).Scan(&processed); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM scheduler_outbox WHERE event_key=$1`, "force:"+taskID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if processed != 0 || events != 0 {
+		t.Fatalf("raced force consumed TaskID: processed=%d events=%d", processed, events)
+	}
+}
+
+func waitForAdvisoryWaiters(t *testing.T, db *pgxpool.Pool, ctx context.Context, want int) {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var count int
+		if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%hashtextextended%'`).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count >= want {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for %d advisory lock waiters (got %d)", want, count)
+		case <-ticker.C:
+		}
+	}
+}
 func TestDueOutboxRollback(t *testing.T) {
 	st, db := integrationStore(t)
 	ctx := t.Context()
