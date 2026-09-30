@@ -27,6 +27,8 @@ Deployment documentation now explains RabbitMQ's stable hostname/nodename requir
 
 Follow-up from independent Task 6 review: `RABBITMQ_HOSTNAME`, `RABBITMQ_NODENAME`, and `RABBITMQ_USE_LONGNAME` are now configurable, with stable fresh-install defaults and explicit restoration instructions requiring the recorded hostname and exact nodename. `docker compose config` was validated against a minimal isolated fixture using defaults and fake legacy identity overrides; no service was started. The root `./...` evidence wording was corrected to list all six module paths explicitly.
 
+Follow-up from whole-branch review: the shared outbox worker now claims one event immediately before publishing. `TestWorkerClaimsNextEventOnlyWhenReadyToPublish` uses a controllable lease clock and seven simulated 9-second successful confirms, then holds event 8 after the former 60-second batch lease would have elapsed; worker 2 claims/publishes the still-unclaimed event 9 without concurrently publishing event 8. Against the former 20-event limit the test failed with `same outbox event published concurrently: "event-8"`; with claim limit one, `go test -race -count=1 -timeout=120s ./pkg/outbox` passed. This uses more claim transactions per event. The unavoidable at-least-once window after broker confirm and before marking the row published remains.
+
 ## Verification on 2026-10-01
 
 - All six Go modules: `go test -race -count=1 -timeout=120s ./services/bot/... ./services/gateway/... ./services/scheduler/... ./services/extractor/... ./services/notifier/... ./shared/...` passed. The workspace root does not traverse these modules with `./...`.

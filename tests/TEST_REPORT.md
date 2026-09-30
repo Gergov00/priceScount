@@ -33,3 +33,5 @@ Runner создаёт отдельный Compose-проект с динамич�
 Подробная матрица закрытия и ограничений: [AUDIT_REPAIR_RESULT.md](../docs/AUDIT_REPAIR_RESULT.md). Независимый финальный review контроллера этой Task 6 ревизии ещё ожидается.
 
 Follow-up configuration review: Compose was checked using an isolated minimal config fixture, empty fake env file, and fake legacy hostname/nodename/longname env file. Defaults and explicit overrides resolved as expected; no service was started. Existing RabbitMQ restoration docs now require setting both identity values to their recorded values and retaining the source container/volume until restored ready and unacknowledged messages are verified. This is a config/doc-only follow-up; no production data or container was accessed.
+
+Follow-up lease review: a deterministic two-worker controlled-clock regression reproduced concurrent publication with the former 20-event claim and passed with one-at-a-time claim after `go test -race -count=1 -timeout=120s ./pkg/outbox`. The fix adds a claim transaction for each event and does not remove the documented at-least-once publish-confirm/mark window.

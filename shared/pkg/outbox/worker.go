@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	batchSize      = 20
+	claimLimit     = 1
 	leaseDuration  = 60 * time.Second
 	publishTimeout = 10 * time.Second
 	minBackoff     = time.Second
@@ -47,7 +47,9 @@ func (w *Worker) Run(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		events, err := w.store.Claim(ctx, batchSize, leaseDuration)
+		// Claim only the event we are about to publish so each lease starts
+		// just before its own publish timeout, not while it waits in a batch.
+		events, err := w.store.Claim(ctx, claimLimit, leaseDuration)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()

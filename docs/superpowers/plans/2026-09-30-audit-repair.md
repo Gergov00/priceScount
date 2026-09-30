@@ -57,11 +57,12 @@
 - Outbox `Event` имеет `ID, LeaseToken, Queue string`, `Payload json.RawMessage`, `Attempts int`.
 - Consumer-owned `Store`: `Claim(ctx context.Context, limit int, lease time.Duration) ([]Event, error)`, `MarkPublished(ctx context.Context, id, leaseToken string) error`, `Retry(ctx context.Context, id, leaseToken, lastError string, delay time.Duration) error`.
 - Consumer-owned `Publisher`: существующий Publish signature.
-- `New(st Store, publisher Publisher) *Worker`, `(*Worker).Run(ctx context.Context) error`; bounded batch=20, lease=60s, publish timeout=10s, backoff=1s…60s.
+- `New(st Store, publisher Publisher) *Worker`, `(*Worker).Run(ctx context.Context) error`; claim one event immediately before publishing, lease=60s, publish timeout=10s, backoff=1s…60s. This adds one claim transaction per event but prevents queued items' leases aging during earlier publishes.
 
 - [x] Implement отдельный publisher channel, один in-flight publish, confirms, mandatory routing/returns и context-bound ожидание. Serial lock ожидания не блокирует получение consumer channel или Close; redial имеет dial deadline. Ошибка routing/confirm не считается успехом.
 - [x] Implement claim → Publish → mark/retry loop вне DB-транзакции; ctx отменяет idle/backoff. Для некорректного payload оставить событие с ошибкой, без удаления и без tight loop.
 - [x] Add tests `TestPublishUnroutableFails`, `TestPublishCancelled`, `TestWorkerRetriesThenPublishes`, `TestWorkerStopsOnCancel`: возвращённое сообщение → error; cancelled ctx → error; publish failure → Retry, без MarkPublished; следующий успех → mark с тем же lease token.
+- [x] Add a two-worker controlled-clock regression: successful early confirms advance virtual time by 9s each; while the eighth event is held after the old batch lease expires, the second worker must publish the still-unclaimed ninth event without concurrent delivery of the eighth. The test fails against the former 20-event claim.
 - [x] Verify `go test -race -count=1 ./shared/...`; инфраструктурные cases запускаются общим integration runner. PASS, существующие Ack/redelivery/reconnect не нарушены.
 - [x] Review diff отдельным Luna/low reviewer, исправить существенные замечания. Commit только файлы этой задачи после проверок, не включать посторонние изменения.
 
