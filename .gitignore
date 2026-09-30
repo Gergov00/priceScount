@@ -2,3 +2,4 @@
 *.exe
 *.test
 .claude
+tests/results/
