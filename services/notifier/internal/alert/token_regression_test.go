@@ -1,8 +1,7 @@
-//go:build regression
-
 package alert
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -10,8 +9,8 @@ import (
 )
 
 func TestTransportErrorDoesNotExposeBotToken(t *testing.T) {
-	withTransport(t, roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("connection refused") }))
-	err := send("secret-token", 12, "text")
+	s := NewTelegramSender("secret-token", WithHTTPClient(client(roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("connection refused") }))))
+	err := s.sendOnce(context.Background(), 12, "text")
 	if err == nil {
 		t.Fatal("expected transport failure")
 	}

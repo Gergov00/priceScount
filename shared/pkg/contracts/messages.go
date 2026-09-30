@@ -53,9 +53,10 @@ type TrackRequest struct {
 
 // NotifyTask is published to the notify.tasks queue for delivery to the user.
 type NotifyTask struct {
-	TaskID    string `json:"task_id"`
-	Channel   string `json:"channel"` // telegram | email | push
-	Target    string `json:"target"`  // chat_id (as string), email, device token
-	Text      string `json:"text"`
-	Direction string `json:"direction,omitempty"` // up | down
+	TaskID    string    `json:"task_id"`
+	Channel   string    `json:"channel"` // telegram | email | push
+	Target    string    `json:"target"`  // chat_id (as string), email, device token
+	Text      string    `json:"text"`
+	Direction string    `json:"direction,omitempty"` // up | down
+	NotBefore time.Time `json:"not_before,omitempty"`
 }

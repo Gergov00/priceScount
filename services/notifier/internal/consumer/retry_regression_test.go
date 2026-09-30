@@ -1,8 +1,7 @@
-//go:build regression
-
 package consumer
 
 import (
+	"context"
 	"errors"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"testing"
@@ -10,10 +9,11 @@ import (
 
 func TestTransientSendFailureMustRequeue(t *testing.T) {
 	s := &fakeSender{err: errors.New("temporary network failure")}
-	c := New(fakeMQ{}, s)
+	mq := &fakeMQ{}
+	c := New(mq, s, 0)
 	a := &ackRecorder{}
-	c.handle(amqp.Delivery{Acknowledger: a, Body: []byte(`{"channel":"telegram","target":"123","text":"hello"}`)})
-	if !a.nack || !a.requeue {
-		t.Fatal("transient Telegram failure must requeue notification")
+	c.handle(context.Background(), amqp.Delivery{Acknowledger: a, Body: []byte(`{"channel":"telegram","target":"123","text":"hello"}`)})
+	if mq.queue != "notify.retry" || !a.ack || a.nack {
+		t.Fatal("transient Telegram failure must transfer to durable retry queue before Ack")
 	}
 }

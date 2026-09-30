@@ -18,6 +18,9 @@ const (
 	QueuePriceResults  = "price.results"
 	QueueTrackRequests = "track.requests"
 	QueueNotifyTasks   = "notify.tasks"
+	QueueNotifyRetry   = "notify.retry"
+	QueueNotifyDead    = "notify.dead"
+	NotifyRetryDelay   = 30 * time.Second
 	dialTimeout        = 5 * time.Second
 	closeTimeout       = time.Second
 )
@@ -223,6 +226,41 @@ func (c *Connection) DeclareQueue(name string) error {
 	}
 	_, err := ch.QueueDeclare(name, true, false, false, false, nil)
 	return err
+}
+
+// DeclareNotifyQueues creates the durable notification task, retry and dead-letter
+// queues. The retry queue expires messages back to the supplied task queue.
+func (c *Connection) DeclareNotifyQueues(taskQueue, retryQueue, deadQueue string, retryDelay time.Duration) error {
+	c.mu.Lock()
+	conn := c.conn
+	closed := c.closed
+	c.mu.Unlock()
+	if closed || conn == nil {
+		return fmt.Errorf("connection unavailable")
+	}
+	ch, err := conn.Channel()
+	if err != nil {
+		return fmt.Errorf("open notifier declaration channel: %w", err)
+	}
+	defer func() {
+		if err := ch.Close(); err != nil {
+			slog.Warn("close notifier declaration channel", "error", err)
+		}
+	}()
+	if _, err := ch.QueueDeclare(taskQueue, true, false, false, false, nil); err != nil {
+		return fmt.Errorf("declare %s: %w", taskQueue, err)
+	}
+	if _, err := ch.QueueDeclare(retryQueue, true, false, false, false, amqp.Table{
+		"x-message-ttl":             int32(retryDelay / time.Millisecond),
+		"x-dead-letter-exchange":    "",
+		"x-dead-letter-routing-key": taskQueue,
+	}); err != nil {
+		return fmt.Errorf("declare %s: %w", retryQueue, err)
+	}
+	if _, err := ch.QueueDeclare(deadQueue, true, false, false, false, nil); err != nil {
+		return fmt.Errorf("declare %s: %w", deadQueue, err)
+	}
+	return nil
 }
 
 func (c *Connection) Publish(ctx context.Context, queue string, v any) error {

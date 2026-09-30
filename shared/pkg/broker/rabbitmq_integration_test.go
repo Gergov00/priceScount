@@ -130,6 +130,52 @@ func TestPublishReconnectsAfterPublisherChannelCloses(t *testing.T) {
 	}
 }
 
+func TestNotifyRetryTTLAndDeadQueueDeclarations(t *testing.T) {
+	t.Parallel()
+	url := rabbitMQURL(t)
+	tasks := uniqueIntegrationQueue("notify-tasks")
+	retry := uniqueIntegrationQueue("notify-retry")
+	dead := uniqueIntegrationQueue("notify-dead")
+	connection := newIntegrationConnection(t, url)
+	if err := connection.DeclareNotifyQueues(tasks, retry, dead, 150*time.Millisecond); err != nil {
+		t.Fatalf("DeclareNotifyQueues() error = %v", err)
+	}
+	cleanup := func(queue string) {
+		ch := newAdminChannel(t, url)
+		if _, err := ch.QueueDelete(queue, false, false, false); err != nil {
+			t.Errorf("delete %s: %v", queue, err)
+		}
+	}
+	t.Cleanup(func() { cleanup(tasks); cleanup(retry); cleanup(dead) })
+
+	if err := connection.Publish(context.Background(), retry, map[string]string{"task_id": "retry"}); err != nil {
+		t.Fatalf("publish retry: %v", err)
+	}
+	deliveries, err := connection.Consume(tasks, "notify-ttl-test")
+	if err != nil {
+		t.Fatalf("consume tasks: %v", err)
+	}
+	select {
+	case d := <-deliveries:
+		if err := d.Ack(false); err != nil {
+			t.Fatalf("ack dead-lettered retry: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("retry message did not return to task queue after TTL")
+	}
+
+	if err := connection.Publish(context.Background(), dead, map[string]string{"task_id": "dead"}); err != nil {
+		t.Fatalf("publish dead: %v", err)
+	}
+	deadDeliveries, err := connection.Consume(dead, "notify-dead-test")
+	if err != nil {
+		t.Fatalf("consume dead: %v", err)
+	}
+	if got := receiveDelivery(t, deadDeliveries).Body; string(got) != `{"task_id":"dead"}` {
+		t.Fatalf("dead queue body=%s", got)
+	}
+}
+
 func rabbitMQURL(t *testing.T) string {
 	t.Helper()
 	url := os.Getenv("TEST_RABBITMQ_URL")

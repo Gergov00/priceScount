@@ -9,10 +9,10 @@ import (
 	"go.uber.org/fx"
 	"go.uber.org/fx/fxevent"
 
-	"github.com/Gergov00/pricescount/shared/pkg/broker"
 	"github.com/Gergov00/pricescount/services/notifier/internal/alert"
 	"github.com/Gergov00/pricescount/services/notifier/internal/config"
 	"github.com/Gergov00/pricescount/services/notifier/internal/consumer"
+	"github.com/Gergov00/pricescount/shared/pkg/broker"
 )
 
 func main() {
@@ -35,7 +35,7 @@ func newBroker(lc fx.Lifecycle, cfg *config.Config) (*broker.Connection, error) 
 	if err != nil {
 		return nil, fmt.Errorf("rabbitmq: %w", err)
 	}
-	if err := conn.DeclareQueue(broker.QueueNotifyTasks); err != nil {
+	if err := conn.DeclareNotifyQueues(broker.QueueNotifyTasks, broker.QueueNotifyRetry, broker.QueueNotifyDead, broker.NotifyRetryDelay); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("declare queue: %w", err)
 	}
@@ -56,10 +56,12 @@ func newConsumer(mq *broker.Connection, sender *alert.TelegramSender) *consumer.
 
 func runConsumer(lc fx.Lifecycle, c *consumer.Consumer, s fx.Shutdowner) {
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 	lc.Append(fx.Hook{
 		OnStart: func(_ context.Context) error {
 			slog.Info("notifier service started")
 			go func() {
+				defer close(done)
 				if err := c.Run(ctx); err != nil {
 					slog.Error("consumer stopped", "error", err)
 					s.Shutdown(fx.ExitCode(1))
@@ -67,9 +69,14 @@ func runConsumer(lc fx.Lifecycle, c *consumer.Consumer, s fx.Shutdowner) {
 			}()
 			return nil
 		},
-		OnStop: func(_ context.Context) error {
+		OnStop: func(stopCtx context.Context) error {
 			cancel()
-			return nil
+			select {
+			case <-done:
+				return nil
+			case <-stopCtx.Done():
+				return stopCtx.Err()
+			}
 		},
 	})
 }
