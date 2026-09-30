@@ -74,13 +74,6 @@ func (s *Store) ProcessPriceResult(ctx context.Context, result contracts.PriceRe
 	if err != nil {
 		return err
 	}
-	tag, err := tx.Exec(ctx, `INSERT INTO processed_price_results(task_id) VALUES($1) ON CONFLICT DO NOTHING`, result.TaskID)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return tx.Commit(ctx)
-	}
 	var forceChat *int64
 	var forceProduct string
 	var chatID int64
@@ -90,12 +83,22 @@ func (s *Store) ProcessPriceResult(ctx context.Context, result contracts.PriceRe
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		if result.Force {
+			if _, err = tx.Exec(ctx, `INSERT INTO processed_price_results(task_id) VALUES($1) ON CONFLICT DO NOTHING`, result.TaskID); err != nil {
+				return err
+			}
 			return tx.Commit(ctx)
 		}
 	} else if forceProduct != result.ProductID {
-		return tx.Commit(ctx)
+		return fmt.Errorf("force task %s does not belong to product %s: %w", result.TaskID, result.ProductID, ErrInvalidResult)
 	} else {
 		forceChat = &chatID
+	}
+	tag, err := tx.Exec(ctx, `INSERT INTO processed_price_results(task_id) VALUES($1) ON CONFLICT DO NOTHING`, result.TaskID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return tx.Commit(ctx)
 	}
 	if result.Success && result.ScrapedAt.IsZero() {
 		return fmt.Errorf("scraped_at: %w", ErrInvalidResult)

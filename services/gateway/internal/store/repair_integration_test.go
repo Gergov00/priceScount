@@ -311,6 +311,89 @@ func TestForcePausedAndFailedFetch(t *testing.T) {
 	}
 }
 
+func TestMismatchedForceProductDoesNotConsumeTaskID(t *testing.T) {
+	st, db := integrationStore(t)
+	ctx := t.Context()
+	u, product := seedProduct(t, st)
+	subID, err := st.CreateSubscription(ctx, u, product, 100, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherProduct, err := st.EnsureProduct(ctx, uuid.NewString(), "Другой товар", "https://www.wildberries.ru/catalog/987654/detail.aspx", "wb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID, err := st.QueueForce(ctx, subID, u, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := contracts.PriceResult{TaskID: taskID, ProductID: otherProduct, Force: true, Success: true, Price: 1, Currency: "RUB", ScrapedAt: time.Now().UTC()}
+	if err = st.ProcessPriceResult(ctx, wrong); !errors.Is(err, ErrInvalidResult) {
+		t.Fatalf("mismatched result error=%v", err)
+	}
+	valid := contracts.PriceResult{TaskID: taskID, ProductID: product, Force: true, Success: true, Price: 125, Currency: "RUB", ScrapedAt: time.Now().UTC()}
+	if err = st.ProcessPriceResult(ctx, valid); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.ProcessPriceResult(ctx, valid); err != nil {
+		t.Fatal(err)
+	}
+	var processed, history, notifications int
+	var target string
+	if err = db.QueryRow(ctx, `SELECT COUNT(*) FROM processed_price_results WHERE task_id=$1`, taskID).Scan(&processed); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.QueryRow(ctx, `SELECT COUNT(*) FROM price_history WHERE task_id=$1`, taskID).Scan(&history); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.QueryRow(ctx, `SELECT COUNT(*),MIN(payload->>'target') FROM gateway_outbox WHERE event_key=$1`, "force-result:"+taskID).Scan(&notifications, &target); err != nil {
+		t.Fatal(err)
+	}
+	if processed != 1 || history != 1 || notifications != 1 || target != "101" {
+		t.Fatalf("processed=%d history=%d notifications=%d target=%s", processed, history, notifications, target)
+	}
+}
+
+func TestSuccessfulForceTimestampBlocksOlderPeriodicResult(t *testing.T) {
+	st, db := integrationStore(t)
+	ctx := t.Context()
+	u, p := seedProduct(t, st)
+	sub, err := st.CreateSubscription(ctx, u, p, 100, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forceTask, err := st.QueueForce(ctx, sub, u, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forcedAt := time.Now().UTC().Truncate(time.Microsecond)
+	if err = st.ProcessPriceResult(ctx, contracts.PriceResult{TaskID: forceTask, ProductID: p, Force: true, Success: true, Price: 150, Currency: "RUB", ScrapedAt: forcedAt}); err != nil {
+		t.Fatal(err)
+	}
+	older := contracts.PriceResult{TaskID: uuid.NewString(), ProductID: p, Success: true, Price: 250, Currency: "RUB", ScrapedAt: forcedAt.Add(-time.Minute)}
+	if err = st.ProcessPriceResult(ctx, older); err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	var latest time.Time
+	var history, alerts int
+	if err = db.QueryRow(ctx, `SELECT alert_state FROM subscriptions WHERE product_id=$1`, p).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.QueryRow(ctx, `SELECT latest_result_at FROM products WHERE id=$1`, p).Scan(&latest); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.QueryRow(ctx, `SELECT COUNT(*) FROM price_history WHERE product_id=$1`, p).Scan(&history); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.QueryRow(ctx, `SELECT COUNT(*) FROM gateway_outbox WHERE event_key LIKE 'alert:%'`).Scan(&alerts); err != nil {
+		t.Fatal(err)
+	}
+	if state != "" || !latest.Equal(forcedAt) || history != 2 || alerts != 0 {
+		t.Fatalf("state=%q latest=%s history=%d alerts=%d", state, latest, history, alerts)
+	}
+}
+
 func TestLeaseOwnership(t *testing.T) {
 	st, db := integrationStore(t)
 	ctx := t.Context()

@@ -191,7 +191,7 @@ func TestHTTPSubscriptionsToPriceAlertsIntegration(t *testing.T) {
 	}
 	request(http.MethodGet, "/lookup/"+lookupResponse.LookupID, "", "test-secret", http.StatusAccepted)
 	// The external scraper boundary is controlled; HTTP/store/broker are real.
-	if err := st.CompleteLookup(t.Context(), task.LookupID, "Телефон", 150); err != nil {
+	if err := st.ProcessPriceResult(t.Context(), contracts.PriceResult{TaskID: uuid.NewString(), LookupID: task.LookupID, Success: true, Name: "Телефон", Price: 150}); err != nil {
 		t.Fatal(err)
 	}
 	request(http.MethodGet, "/lookup/"+task.LookupID, "", "test-secret", http.StatusOK)

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Gergov00/pricescount/shared/pkg/contracts"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -91,7 +92,7 @@ func TestLookupLifecycleIntegration(t *testing.T) {
 	if err != nil || r.Status != LookupPending || r.URL != url {
 		t.Fatalf("pending lookup=%+v err=%v", r, err)
 	}
-	if err := st.CompleteLookup(ctx, id, "Телефон", 1234.50); err != nil {
+	if err := st.ProcessPriceResult(ctx, contracts.PriceResult{TaskID: uuid.NewString(), LookupID: id, Success: true, Name: "Телефон", Price: 1234.50}); err != nil {
 		t.Fatal(err)
 	}
 	r, err = st.GetLookup(ctx, id)
@@ -106,7 +107,7 @@ func TestLookupLifecycleIntegration(t *testing.T) {
 	if err := st.CreateLookup(ctx, failedID, url); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.FailLookup(ctx, failedID, "price unavailable"); err != nil {
+	if err := st.ProcessPriceResult(ctx, contracts.PriceResult{TaskID: uuid.NewString(), LookupID: failedID, Success: false, Error: "price unavailable"}); err != nil {
 		t.Fatal(err)
 	}
 	r, err = st.GetLookup(ctx, failedID)

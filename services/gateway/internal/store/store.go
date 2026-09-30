@@ -66,32 +66,6 @@ func (s *Store) GetLookup(ctx context.Context, id string) (*LookupResult, error)
 	return &r, nil
 }
 
-func (s *Store) CompleteLookup(ctx context.Context, lookupID, name string, price float64) error {
-	// Completed lookups get a longer TTL: the user may take a while to answer
-	// the min/max price questions before the subscription is created.
-	_, err := s.db.Exec(ctx,
-		`UPDATE lookup_requests
-		 SET status='done', name=$2, price=$3, expires_at = NOW() + INTERVAL '1 hour'
-		 WHERE id=$1`,
-		lookupID, name, price,
-	)
-	if err != nil {
-		return fmt.Errorf("complete lookup: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) FailLookup(ctx context.Context, lookupID, errMsg string) error {
-	_, err := s.db.Exec(ctx,
-		`UPDATE lookup_requests SET status='failed', error=$2 WHERE id=$1`,
-		lookupID, errMsg,
-	)
-	if err != nil {
-		return fmt.Errorf("fail lookup: %w", err)
-	}
-	return nil
-}
-
 func (s *Store) DeleteExpiredLookups(ctx context.Context) (int64, error) {
 	tag, err := s.db.Exec(ctx,
 		`DELETE FROM lookup_requests WHERE expires_at < NOW()`,
