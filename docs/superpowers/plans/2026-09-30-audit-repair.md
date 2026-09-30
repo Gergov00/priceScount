@@ -59,11 +59,11 @@
 - Consumer-owned `Publisher`: существующий Publish signature.
 - `New(st Store, publisher Publisher) *Worker`, `(*Worker).Run(ctx context.Context) error`; bounded batch=20, lease=60s, publish timeout=10s, backoff=1s…60s.
 
-- [ ] Implement отдельный publisher channel, один in-flight publish, confirms, mandatory routing/returns и context-bound ожидание. Serial lock ожидания не блокирует получение consumer channel или Close; redial имеет dial deadline. Ошибка routing/confirm не считается успехом.
-- [ ] Implement claim → Publish → mark/retry loop вне DB-транзакции; ctx отменяет idle/backoff. Для некорректного payload оставить событие с ошибкой, без удаления и без tight loop.
-- [ ] Add tests `TestPublishUnroutableFails`, `TestPublishCancelled`, `TestWorkerRetriesThenPublishes`, `TestWorkerStopsOnCancel`: возвращённое сообщение → error; cancelled ctx → error; publish failure → Retry, без MarkPublished; следующий успех → mark с тем же lease token.
-- [ ] Verify `go test -race -count=1 ./shared/...`; инфраструктурные cases запускаются общим integration runner. PASS, существующие Ack/redelivery/reconnect не нарушены.
-- [ ] Review diff отдельным Luna/low reviewer, исправить существенные замечания. Commit только файлы этой задачи после проверок, не включать посторонние изменения.
+- [x] Implement отдельный publisher channel, один in-flight publish, confirms, mandatory routing/returns и context-bound ожидание. Serial lock ожидания не блокирует получение consumer channel или Close; redial имеет dial deadline. Ошибка routing/confirm не считается успехом.
+- [x] Implement claim → Publish → mark/retry loop вне DB-транзакции; ctx отменяет idle/backoff. Для некорректного payload оставить событие с ошибкой, без удаления и без tight loop.
+- [x] Add tests `TestPublishUnroutableFails`, `TestPublishCancelled`, `TestWorkerRetriesThenPublishes`, `TestWorkerStopsOnCancel`: возвращённое сообщение → error; cancelled ctx → error; publish failure → Retry, без MarkPublished; следующий успех → mark с тем же lease token.
+- [x] Verify `go test -race -count=1 ./shared/...`; инфраструктурные cases запускаются общим integration runner. PASS, существующие Ack/redelivery/reconnect не нарушены.
+- [x] Review diff отдельным Luna/low reviewer, исправить существенные замечания. Commit только файлы этой задачи после проверок, не включать посторонние изменения.
 
 ## Task 2: Gateway — атомарные подписки, события и результаты
 
@@ -77,14 +77,14 @@
 - Consumer-owned Store `ProcessPriceResult(ctx context.Context, result contracts.PriceResult) error` выполняет атомарную обработку; consumer Ack только после nil. Ошибка БД → Nack/requeue.
 - Store `ReconcileMonitoring(ctx context.Context) error` сохраняет snapshots всех продуктов, включая inactive. Store outbox методы реализуют интерфейс задачи 1 для `gateway_outbox`.
 
-- [ ] Extend schema idempotently: gateway/scheduler outbox таблицы с unique event_key и lease полями; products.monitor_version/latest_result_at, subscriptions.alert_version, price_history.task_id с partial unique index, processed_price_results и force_requests. Для gateway_outbox payload JSONB, attempts, available_at, lease_token, locked_until, published_at, last_error; partial индекс outstanding. Две outbox-таблицы имеют одинаковый набор полей. Существующие строки/индексы сохранить.
-- [ ] Implement product row lock прежде изменения подписки; recompute desired_active, version и outbox snapshot в одной транзакции. Delete повтор владельца → nil, неизвестный/чужой → ErrNotFound; restore/новые пороги сбрасывают alert_state, идентичный Create сохраняет его.
-- [ ] Implement atomic results: unique TaskID, history, timestamp ordering, serialized threshold transition, stable notify key по subscription+alert_version. Duplicate result → nil без побочных действий. Missing TaskID в новом протоколе reject без горячего requeue; старые сообщения обрабатываются до cutover по инструкции задачи 6.
-- [ ] Implement saved force request: ответ инициатору и при paused, и при fetch failure; unknown/mismatched force TaskID не создаёт чужих уведомлений. Periodic failure не меняет alert_state.
-- [ ] Adapt handler/consumer к transactional Store, убрать DB-then-Publish пути; добавить outbox lifecycle worker и retryable reconciliation в fx. Старые helper методы не оставить альтернативным production-путём обхода outbox.
-- [ ] Add DB tests `TestSubscriptionSnapshotAtomic`, `TestDeleteRetryBrokerUnavailable`, `TestConcurrentResultSingleTransition`, `TestOlderResultDoesNotRevertState`, `TestForcePausedAndFailedFetch`, `TestLeaseOwnership`: rollback не оставляет событие; два DELETE→204/204; две DB connections с TaskID дают history=1/notify=1; старый timestamp не меняет зону; force адресован одному requester; mark старого lease не меняет запись.
-- [ ] Promote corrected F7 regression в обычный integration набор. S2 regression переписать на гарантию transaction commit/outbox delivery вместо требования синхронного Publish, подтвердить сохранение задачи при брокере offline.
-- [ ] Verify targeted gateway `-race`, общим integration runner реальные DB и RabbitMQ сценарии, миграцию дважды и сохранность старой fixture. Review Luna/low и commit scoped files.
+- [x] Extend schema idempotently: gateway/scheduler outbox таблицы с unique event_key и lease полями; products.monitor_version/latest_result_at, subscriptions.alert_version, price_history.task_id с partial unique index, processed_price_results и force_requests. Для gateway_outbox payload JSONB, attempts, available_at, lease_token, locked_until, published_at, last_error; partial индекс outstanding. Две outbox-таблицы имеют одинаковый набор полей. Существующие строки/индексы сохранить.
+- [x] Implement product row lock прежде изменения подписки; recompute desired_active, version и outbox snapshot в одной транзакции. Delete повтор владельца → nil, неизвестный/чужой → ErrNotFound; restore/новые пороги сбрасывают alert_state, идентичный Create сохраняет его.
+- [x] Implement atomic results: unique TaskID, history, timestamp ordering, serialized threshold transition, stable notify key по subscription+alert_version. Duplicate result → nil без побочных действий. Missing TaskID в новом протоколе reject без горячего requeue; старые сообщения обрабатываются до cutover по инструкции задачи 6.
+- [x] Implement saved force request: ответ инициатору и при paused, и при fetch failure; unknown/mismatched force TaskID не создаёт чужих уведомлений. Periodic failure не меняет alert_state.
+- [x] Adapt handler/consumer к transactional Store, убрать DB-then-Publish пути; добавить outbox lifecycle worker и retryable reconciliation в fx. Старые helper методы не оставить альтернативным production-путём обхода outbox.
+- [x] Add DB tests `TestSubscriptionSnapshotAtomic`, `TestDeleteRetryBrokerUnavailable`, `TestConcurrentResultSingleTransition`, `TestOlderResultDoesNotRevertState`, `TestForcePausedAndFailedFetch`, `TestLeaseOwnership`: rollback не оставляет событие; два DELETE→204/204; две DB connections с TaskID дают history=1/notify=1; старый timestamp не меняет зону; force адресован одному requester; mark старого lease не меняет запись.
+- [x] Promote corrected F7 regression в обычный integration набор. S2 regression переписать на гарантию transaction commit/outbox delivery вместо требования синхронного Publish, подтвердить сохранение задачи при брокере offline.
+- [x] Verify targeted gateway `-race`, общим integration runner реальные DB и RabbitMQ сценарии, миграцию дважды и сохранность старой fixture. Review Luna/low и commit scoped files.
 
 ## Task 3: Scheduler — версии, атомарный tick и force
 
@@ -96,13 +96,13 @@
 - `EnqueueForce(ctx context.Context, request contracts.TrackRequest) error`: dedup стабильного TaskID, одноразовый scraper event.
 - `scheduled_urls.monitor_version BIGINT NOT NULL DEFAULT 0`; force дедупликация отдельной таблицей обработанных команд. Store реализует outbox интерфейс задачи 1 для scheduler_outbox.
 
-- [ ] Implement versioned snapshot upsert: обратный порядок и равная версия не меняют active/interval; inactive tombstone не удаляется. URL/product invariant проверяется, некорректные versioned команды не запускают мониторинг.
-- [ ] Implement atomic EnqueueDue: уникальный TaskID каждой принятой due работы, общий commit переноса даты и event, ограниченная партия=100. Tick не Publish напрямую.
-- [ ] Implement EnqueueForce по ID: не менять active/next_check_at, не создавать periodic row для одноразового запроса; повтор команды не создаёт второй scraper event. Consumer Ack после commit.
-- [ ] Wire scheduler outbox worker и shutdown ожидание; удалить вызовы AdvanceNextCheck/SetNextCheck из force production path.
-- [ ] Add tests `TestSnapshotReverseOrder`, `TestInactiveTombstone`, `TestDueOutboxRollback`, `TestForceScheduleUnchanged`, `TestForceReplaySingleTask`: версии 3 inactive, затем 2 active → inactive; rollback оставляет прежнюю дату и 0 events; force сохраняет обе schedule fields; повтор → 1 outbox event.
-- [ ] F6 regression перенести на новый force path и включить в обычные integration tests. Прежний delete-replay контроль заменить проверкой tombstone+version.
-- [ ] Verify scheduler `-race`, интеграции с несколькими workers и остановленным брокером: работа остаётся в outbox и доставляется после восстановления. Review Luna/low, commit scoped files.
+- [x] Implement versioned snapshot upsert: обратный порядок и равная версия не меняют active/interval; inactive tombstone не удаляется. URL/product invariant проверяется, некорректные versioned команды не запускают мониторинг.
+- [x] Implement atomic EnqueueDue: уникальный TaskID каждой принятой due работы, общий commit переноса даты и event, ограниченная партия=100. Tick не Publish напрямую.
+- [x] Implement EnqueueForce по ID: не менять active/next_check_at, не создавать periodic row для одноразового запроса; повтор команды не создаёт второй scraper event. Consumer Ack после commit.
+- [x] Wire scheduler outbox worker и shutdown ожидание; удалить вызовы AdvanceNextCheck/SetNextCheck из force production path.
+- [x] Add tests `TestSnapshotReverseOrder`, `TestInactiveTombstone`, `TestDueOutboxRollback`, `TestForceScheduleUnchanged`, `TestForceReplaySingleTask`: версии 3 inactive, затем 2 active → inactive; rollback оставляет прежнюю дату и 0 events; force сохраняет обе schedule fields; повтор → 1 outbox event.
+- [x] F6 regression перенести на новый force path и включить в обычные integration tests. Прежний delete-replay контроль заменить проверкой tombstone+version.
+- [x] Verify scheduler `-race`, интеграции с несколькими workers и остановленным брокером: работа остаётся в outbox и доставляется после восстановления. Review Luna/low, commit scoped files.
 
 ## Task 4: Notifier — отменяемая доставка и безопасные ошибки
 
@@ -114,11 +114,11 @@
 - Export `ErrPermanent`, typed `RetryError` с `After time.Duration`; retry_after влияет на ожидание. Default local attempts=4, cancellable delays 0/3/6/12s.
 - RabbitMQ durable `notify.retry` delay queue TTL=30s и dead-letter routing=`notify.tasks`; durable `notify.dead` для постоянных ошибок.
 
-- [ ] Implement context requests/retry waits и safe transport errors: извлечь url.Error.Err, удалить token из API descriptions; не логировать исходный URL. Классификация сети/429/5xx transient, остальных 4xx permanent.
-- [ ] Implement consumer: успех Ack; permanent → confirmed publish DLQ затем Ack; transient → confirmed publish retry затем Ack; publish failure → Nack/requeue с отменяемой паузой без tight loop. Shutdown не Ack недоставленное сообщение. Retry_after дольше 30s сохраняется с задачей и учитывается перед следующей попыткой.
-- [ ] Wire contexts и WaitGroup lifecycle так, чтобы sender stopped до закрытия broker. Малформированный JSON в DLQ, а не вечный retry.
-- [ ] Adapt existing S3/S8 tests to new APIs and promote to ordinary suite. Add `TestSendCancelled`, `TestRetryAfter`, `TestPermanentDeliveryDeadLetters`, `TestRetryPublishFailureDoesNotAck`: server block отменяется; 429 delay учтён; DLQ success только затем Ack; retry publish failure→не Ack; fake token отсутствует в возвращаемой ошибке и captured log.
-- [ ] Verify notifier unit `-race` и real broker delay/DLQ routing integration без реального Telegram. Review Luna/low, commit scoped files.
+- [x] Implement context requests/retry waits и safe transport errors: извлечь url.Error.Err, удалить token из API descriptions; не логировать исходный URL. Классификация сети/429/5xx transient, остальных 4xx permanent.
+- [x] Implement consumer: успех Ack; permanent → confirmed publish DLQ затем Ack; transient → confirmed publish retry затем Ack; publish failure → Nack/requeue с отменяемой паузой без tight loop. Shutdown не Ack недоставленное сообщение. Retry_after дольше 30s сохраняется с задачей и учитывается перед следующей попыткой.
+- [x] Wire contexts и WaitGroup lifecycle так, чтобы sender stopped до закрытия broker. Малформированный JSON в DLQ, а не вечный retry.
+- [x] Adapt existing S3/S8 tests to new APIs and promote to ordinary suite. Add `TestSendCancelled`, `TestRetryAfter`, `TestPermanentDeliveryDeadLetters`, `TestRetryPublishFailureDoesNotAck`: server block отменяется; 429 delay учтён; DLQ success только затем Ack; retry publish failure→не Ack; fake token отсутствует в возвращаемой ошибке и captured log.
+- [x] Verify notifier unit `-race` и real broker delay/DLQ routing integration без реального Telegram. Review Luna/low, commit scoped files.
 
 ## Task 5: Bot — порядок диалога, страницы; WB — cancellation
 
@@ -130,12 +130,12 @@
 - `buildMyListPage(subs []gateway.Subscription, page int) (text string, keyboard tgbotapi.InlineKeyboardMarkup, actualPage int)`; максимум 10 товаров, максимум 4096 UTF-16 units текста, длинное имя ограничить 200 units без разрыва Unicode. Navigation callback=`page:<n>`; текущая page в Session.
 - Сохранить `FetchProduct(ctx context.Context, url string)` API, browser context наследует cancellation входного ctx и ограничен 40s.
 
-- [ ] Implement copy-safe Session и conditional lookup completion. FIFO dispatcher заменяет goroutine на каждый update; /cancel очищает state, позднее завершение не восстанавливает его. Удалить раскрытие pointers и несогласованные read-modify-write paths.
-- [ ] Implement page rendering/callbacks, ограничение UTF-16, кнопки только текущей страницы; pause/edit/delete сохраняют page с clamp при удалении последнего элемента. Ошибки Send/Request вернуть или обработать safe diagnostic.
-- [ ] Sanitize Bot transport/API errors перед slog; не писать ошибки библиотеки с URL token в лог. Runtime stop отменяет lookup и waits.
-- [ ] Implement WB cancellation: already-cancelled ctx не запускает Chrome; context.AfterFunc связывает parent cancellation с browser cancel, освобождается при завершении.
-- [ ] Update/promote S1/F10 regression. Add `TestLookupCompletionAfterCancel`, `TestChatFIFO`, `TestMyListUnicodePages`, `TestDeleteLastPageItem`, `TestCancelledFetch`: cancel/new ID предотвращают старое completion; FIFO updates не переупорядочены; все страницы <=4096 units, каждый sub доступен; последний элемент clamp; cancellation timely. Browser mid-fetch test под integration с контролируемым локальным server и отдельным Chrome, не реальным WB.
-- [ ] Verify bot/shared `-race`; ошибка token diagnostics covered for Bot; reviewer Luna/low и scoped commit.
+- [x] Implement copy-safe Session и conditional lookup completion. FIFO dispatcher заменяет goroutine на каждый update; /cancel очищает state, позднее завершение не восстанавливает его. Удалить раскрытие pointers и несогласованные read-modify-write paths.
+- [x] Implement page rendering/callbacks, ограничение UTF-16, кнопки только текущей страницы; pause/edit/delete сохраняют page с clamp при удалении последнего элемента. Ошибки Send/Request вернуть или обработать safe diagnostic.
+- [x] Sanitize Bot transport/API errors перед slog; не писать ошибки библиотеки с URL token в лог. Runtime stop отменяет lookup и waits.
+- [x] Implement WB cancellation: already-cancelled ctx не запускает Chrome; context.AfterFunc связывает parent cancellation с browser cancel, освобождается при завершении.
+- [x] Update/promote S1/F10 regression. Add `TestLookupCompletionAfterCancel`, `TestChatFIFO`, `TestMyListUnicodePages`, `TestDeleteLastPageItem`, `TestCancelledFetch`: cancel/new ID предотвращают старое completion; FIFO updates не переупорядочены; все страницы <=4096 units, каждый sub доступен; последний элемент clamp; cancellation timely. Browser mid-fetch test под integration с контролируемым локальным server и отдельным Chrome, не реальным WB.
+- [x] Verify bot/shared `-race`; ошибка token diagnostics covered for Bot; reviewer Luna/low и scoped commit.
 
 ## Task 6: Persistence, cutover, CI и итоговый review
 
@@ -143,13 +143,13 @@
 
 **Interfaces:** запуск остаётся `scripts/test-integration.ps1`; CI Linux запускает workspace-модули явно, infrastructure tests только с заданными TEST_POSTGRES_DSN/TEST_RABBITMQ_URL. cmd fx smoke checks используют controlled resources.
 
-- [ ] Add named volume для `/var/lib/rabbitmq` и стабильный hostname. Документировать сохранение существующих broker данных перед переходом на новый volume; не выполнять удаление рабочего контейнера/volume.
-- [ ] Write cutover: backup БД/брокера; stop старых producers, drain legacy queues старой версией; stop consumers; apply init.sql; start новая версия, reconciliation всех products; verify pending outbox и queue health. При сбое drain не смешивать версии; explicit rollback с сохранением outbox, без downgrade с live versioned queues.
-- [ ] Add CI unit/integration race, build и vet всех шести модулей; build Docker images; cache Go. Перевести закрытые regression checks в основной набор, не оставить старые defect tests за тегом как единственную проверку.
-- [ ] Add isolated broker recovery test procedure: unique Compose project с собственным named volume, persistent task и durable queue, recreate broker с тем же hostname/volume, consume прежнюю task; только после проверки cleanup своих ресурсов. PostgreSQL upgrade fixture с данными прогнать через schema дважды, проверить сохранность пользователей/подписок/history.
-- [ ] Run `scripts/test-integration.ps1 -Coverage`, go build/vet всех модулей, Docker build и shutdown smoke checks. Записать реальные результаты и ограничения Chrome/externals. Все обязательные проверки PASS; инфраструктурную недоступность нельзя считать PASS.
-- [ ] Fresh Luna/low reviewer проверяет весь diff против spec и CLAUDE.md, особо lease races/confirm returns/deploy compatibility. Исправить существенные замечания и повторить затронутые проверки.
-- [ ] Write closure matrix S1–S8/F4–F10 с production files, test names и результатами; оставить PROJECT_REVIEW.md исходным отчётом. Commit scoped files, не push/merge/deploy без отдельного запроса.
+- [x] Add named volume для `/var/lib/rabbitmq` и стабильный hostname. Документировать сохранение существующих broker данных перед переходом на новый volume; не выполнять удаление рабочего контейнера/volume.
+- [x] Write cutover: проверенная DB backup и broker recovery, остановка ingress/ticks, последовательный drain `track.requests` и зависимых очередей старой версией, transactional `init.sql`, запуск полного нового набора, reconciliation и outbox/queue health проверки; rollback сохраняет outboxes.
+- [x] Add CI unit/integration race, build и vet всех шести модулей; build Docker images; cache Go. Перевести закрытые regression checks в основной набор.
+- [x] Add isolated broker recovery script: unique Compose project с собственным named volume, durable queue и publisher-confirmed persistent task; forced recreate с тем же hostname/volume и consumption прежнего body. Добавить PostgreSQL upgrade fixture и duplicate preflight test.
+- [x] Run all six module unit/race, `scripts/test-integration.ps1 -Coverage` and `-Regression`, build/vet всех модулей, Docker builds, recovery script и shutdown smoke checks. Записать фактические результаты и ограничения Chrome/externals.
+- [ ] Fresh independent controller review всего diff против spec и CLAUDE.md, особо lease races/confirm returns/deploy compatibility. Исправить существенные замечания и повторить затронутые проверки.
+- [x] Write closure matrix S1–S8/F4–F10 с production files, test names и результатами; scoped commit, не push/merge/deploy.
 
 ## Self-review и handoff
 

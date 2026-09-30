@@ -3,9 +3,12 @@
 package store
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +16,8 @@ import (
 
 	"github.com/Gergov00/pricescount/shared/pkg/contracts"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestSubscriptionSnapshotAtomic(t *testing.T) {
@@ -225,6 +230,291 @@ func TestOlderResultDoesNotRevertState(t *testing.T) {
 	if state != "down" || !latest.Equal(newer) || history != 2 {
 		t.Fatalf("state=%s latest=%s history=%d", state, latest, history)
 	}
+}
+
+func TestEqualTimestampDifferentTaskIDsKeepBothHistoryRowsAndTransitions(t *testing.T) {
+	st, db := integrationStore(t)
+	ctx := t.Context()
+	user, product := seedProduct(t, st)
+	subID, err := st.CreateSubscription(ctx, user, product, 100, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scrapedAt := time.Now().UTC().Truncate(time.Microsecond)
+	firstID, secondID := uuid.NewString(), uuid.NewString()
+	for _, result := range []contracts.PriceResult{
+		{TaskID: firstID, ProductID: product, Price: 50, Currency: "RUB", ScrapedAt: scrapedAt, Success: true},
+		{TaskID: secondID, ProductID: product, Price: 250, Currency: "RUB", ScrapedAt: scrapedAt, Success: true},
+	} {
+		if err := st.ProcessPriceResult(ctx, result); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var history, alerts int
+	var state string
+	var latest time.Time
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM price_history WHERE product_id=$1 AND task_id IN ($2,$3)`, product, firstID, secondID).Scan(&history); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx, `SELECT alert_state FROM subscriptions WHERE id=$1`, subID).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx, `SELECT latest_result_at FROM products WHERE id=$1`, product).Scan(&latest); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM gateway_outbox WHERE event_key LIKE 'alert:%'`).Scan(&alerts); err != nil {
+		t.Fatal(err)
+	}
+	if history != 2 || state != "up" || !latest.Equal(scrapedAt) || alerts != 2 {
+		t.Fatalf("equal-time results history=%d state=%q latest=%s alerts=%d", history, state, latest, alerts)
+	}
+}
+
+func TestConcurrentPauseAndAddKeepsLatestSnapshotActive(t *testing.T) {
+	for _, first := range []string{"add", "pause"} {
+		t.Run(first+"-first", func(t *testing.T) {
+			st, db := integrationStore(t)
+			ctx := t.Context()
+			user1, product := seedProduct(t, st)
+			if _, err := st.CreateSubscription(ctx, user1, product, 100, 200); err != nil {
+				t.Fatal(err)
+			}
+			user2, err := st.UpsertUser(ctx, 202)
+			if err != nil {
+				t.Fatal(err)
+			}
+			subID := subscriptionID(t, db, user1, product)
+			lock, err := db.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			committed := false
+			defer func() {
+				if !committed {
+					if err := lock.Rollback(context.Background()); err != nil {
+						t.Errorf("release held product lock: %v", err)
+					}
+				}
+			}()
+			if err = lock.QueryRow(ctx, `SELECT id FROM products WHERE id=$1 FOR UPDATE`, product).Scan(new(string)); err != nil {
+				t.Fatal(err)
+			}
+
+			type outcome struct{ err error }
+			started := make(chan outcome, 2)
+			launch := func(action string) {
+				go func() {
+					started <- outcome{err: func() error {
+						if action == "pause" {
+							return st.PauseSubscription(ctx, subID, user1)
+						}
+						_, createErr := st.CreateSubscription(ctx, user2, product, 80, 220)
+						return createErr
+					}()}
+				}()
+			}
+			second := "pause"
+			if first == "pause" {
+				second = "add"
+			}
+			launch(first)
+			waitForBlockedProductLock(t, db, 1)
+			launch(second)
+			waitForBlockedProductLock(t, db, 2)
+			if err = lock.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			committed = true
+			for range 2 {
+				if result := <-started; result.err != nil {
+					t.Fatal(result.err)
+				}
+			}
+
+			var active bool
+			var watching int
+			var version int64
+			if err := db.QueryRow(ctx, `SELECT monitor_version FROM products WHERE id=$1`, product).Scan(&version); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM subscriptions WHERE product_id=$1 AND active AND NOT paused`, product).Scan(&watching); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow(ctx, `SELECT (payload->>'active')::boolean FROM gateway_outbox WHERE event_key=$1`, fmt.Sprintf("track:%s:%d", product, version)).Scan(&active); err != nil {
+				t.Fatal(err)
+			}
+			if !active || watching != 1 {
+				t.Fatalf("latest snapshot active=%v watching=%d version=%d", active, watching, version)
+			}
+		})
+	}
+}
+
+func TestLegacySchemaUpgradeTwicePreservesUserSubscriptionHistoryAndSchedule(t *testing.T) {
+	db := legacyIntegrationDB(t)
+	ctx := t.Context()
+	fixture, err := os.ReadFile("testdata/pre_audit_repair.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(ctx, string(fixture)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(ctx, `
+		INSERT INTO users(id,chat_id,created_at) VALUES('10000000-0000-4000-8000-000000000001',701,'2026-09-25 10:00:00+00');
+		INSERT INTO products(id,name,url,platform,created_at) VALUES('20000000-0000-4000-8000-000000000001','legacy phone','https://www.wildberries.ru/catalog/701/detail.aspx','wb','2026-09-25 10:00:00+00');
+		INSERT INTO subscriptions(id,user_id,product_id,min_price,max_price,paused,active,alert_state,created_at)
+		VALUES('30000000-0000-4000-8000-000000000001','10000000-0000-4000-8000-000000000001','20000000-0000-4000-8000-000000000001',100,200,true,true,'down','2026-09-25 10:00:00+00');
+		INSERT INTO price_history(id,product_id,price,currency,scraped_at)
+		VALUES('40000000-0000-4000-8000-000000000001','20000000-0000-4000-8000-000000000001',75,'RUB','2026-09-25 10:00:00+00');
+		INSERT INTO scheduled_urls(id,product_id,url,platform,next_check_at,check_interval_hours,active)
+		VALUES('50000000-0000-4000-8000-000000000001','20000000-0000-4000-8000-000000000001','https://www.wildberries.ru/catalog/701/detail.aspx','wb','2026-09-26 10:00:00+00',3,false)`); err != nil {
+		t.Fatal(err)
+	}
+	migration, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "migrations", "init.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err = db.Exec(ctx, string(migration)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var userChat int64
+	var productName, subscriptionState, historyCurrency, scheduledURL string
+	var min, max, price float64
+	var paused, active, scheduledActive bool
+	var latest time.Time
+	if err = db.QueryRow(ctx, `SELECT u.chat_id,p.name,s.alert_state,s.min_price,s.max_price,s.paused,s.active,h.price,h.currency,p.latest_result_at,sc.url,sc.active FROM users u JOIN subscriptions s ON s.user_id=u.id JOIN products p ON p.id=s.product_id JOIN price_history h ON h.product_id=p.id JOIN scheduled_urls sc ON sc.product_id=p.id WHERE u.id='10000000-0000-4000-8000-000000000001'`).Scan(&userChat, &productName, &subscriptionState, &min, &max, &paused, &active, &price, &historyCurrency, &latest, &scheduledURL, &scheduledActive); err != nil {
+		t.Fatal(err)
+	}
+	if userChat != 701 || productName != "legacy phone" || subscriptionState != "down" || min != 100 || max != 200 || !paused || !active || price != 75 || historyCurrency != "RUB" || !latest.Equal(time.Date(2026, 9, 25, 10, 0, 0, 0, time.UTC)) || scheduledURL != "https://www.wildberries.ru/catalog/701/detail.aspx" || scheduledActive {
+		t.Fatalf("legacy data changed: chat=%d product=%q state=%q range=%v-%v paused=%v active=%v history=%v %s latest=%s schedule=%q scheduled_active=%v", userChat, productName, subscriptionState, min, max, paused, active, price, historyCurrency, latest, scheduledURL, scheduledActive)
+	}
+	var users, subscriptions, history, schedules, missingTaskIDs int
+	if err = db.QueryRow(ctx, `SELECT COUNT(*) FROM users`).Scan(&users); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.QueryRow(ctx, `SELECT COUNT(*) FROM subscriptions`).Scan(&subscriptions); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.QueryRow(ctx, `SELECT COUNT(*) FROM price_history`).Scan(&history); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.QueryRow(ctx, `SELECT COUNT(*) FROM scheduled_urls`).Scan(&schedules); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.QueryRow(ctx, `SELECT COUNT(*) FROM price_history WHERE task_id IS NULL`).Scan(&missingTaskIDs); err != nil {
+		t.Fatal(err)
+	}
+	if users != 1 || subscriptions != 1 || history != 1 || schedules != 1 || missingTaskIDs != 1 {
+		t.Fatalf("row preservation users=%d subscriptions=%d history=%d schedules=%d legacy task IDs=%d", users, subscriptions, history, schedules, missingTaskIDs)
+	}
+}
+
+func TestLegacyDuplicateScheduledProductsFailWithoutDeletingData(t *testing.T) {
+	db := legacyIntegrationDB(t)
+	ctx := t.Context()
+	fixture, err := os.ReadFile("testdata/pre_audit_repair.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(ctx, string(fixture)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(ctx, `INSERT INTO scheduled_urls(product_id,url,platform) VALUES
+		('20000000-0000-4000-8000-000000000099','https://example.test/duplicate-a','wb'),
+		('20000000-0000-4000-8000-000000000099','https://example.test/duplicate-b','wb')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migration, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "migrations", "init.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(ctx, string(migration)); err == nil || !strings.Contains(err.Error(), "resolve duplicates before applying scheduler identity constraint") {
+		t.Fatalf("duplicate product migration error=%v, want explicit reconciliation instruction", err)
+	}
+	var rows int
+	if err = db.QueryRow(ctx, `SELECT COUNT(*) FROM scheduled_urls WHERE product_id='20000000-0000-4000-8000-000000000099'`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	var productIndex bool
+	if err = db.QueryRow(ctx, `SELECT to_regclass('idx_scheduled_urls_product_id') IS NOT NULL`).Scan(&productIndex); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 || productIndex {
+		t.Fatalf("duplicate data rows=%d, unique index created=%v", rows, productIndex)
+	}
+}
+
+func legacyIntegrationDB(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("TEST_POSTGRES_DSN is required for integration tests")
+	}
+	ctx := t.Context()
+	admin, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(admin.Close)
+	schema := "legacy_" + uuid.NewString()
+	quoted := pgx.Identifier{schema}.Sanitize()
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+quoted); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = quoted + ",public"
+	cfg.ConnConfig.RuntimeParams["application_name"] = schema
+	db, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(db.Close)
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := admin.Exec(cleanupCtx, "DROP SCHEMA "+quoted+" CASCADE"); err != nil {
+			t.Errorf("drop legacy schema: %v", err)
+		}
+	})
+	return db
+}
+
+func subscriptionID(t *testing.T, db *pgxpool.Pool, userID, productID string) string {
+	t.Helper()
+	var id string
+	if err := db.QueryRow(t.Context(), `SELECT id FROM subscriptions WHERE user_id=$1 AND product_id=$2`, userID, productID).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func waitForBlockedProductLock(t *testing.T, db *pgxpool.Pool, want int) {
+	t.Helper()
+	var applicationName string
+	if err := db.QueryRow(t.Context(), `SELECT current_setting('application_name')`).Scan(&applicationName); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var blocked int
+		err := db.QueryRow(t.Context(), `SELECT COUNT(*) FROM pg_stat_activity WHERE application_name=$1 AND wait_event_type='Lock' AND query ILIKE '%from products where id=$1 for update%'`, applicationName).Scan(&blocked)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if blocked >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d blocked product locks", want)
 }
 
 func TestForcePausedAndFailedFetch(t *testing.T) {

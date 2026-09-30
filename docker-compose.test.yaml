@@ -21,6 +21,7 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: pricescount_test
       RABBITMQ_DEFAULT_PASS: pricescount_test
+      RABBITMQ_NODENAME: rabbit@pricescount-test-rabbitmq
     ports:
       - "127.0.0.1::5672"
     healthcheck:

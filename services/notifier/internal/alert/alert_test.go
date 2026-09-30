@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,8 @@ func TestSendClassifiesTelegramResponses(t *testing.T) {
 	}{
 		{"accepted", 200, `{"ok":true}`, false, false},
 		{"bad request permanent", 400, `{"ok":false,"description":"bad request"}`, true, true},
+		{"bad request non-json permanent", 400, `upstream proxy rejected request`, true, true},
+		{"forbidden non-json permanent", 403, `forbidden`, true, true},
 		{"rate limit transient", 429, `{"ok":false,"parameters":{"retry_after":1}}`, false, true},
 		{"server error transient", 503, `{"ok":false}`, false, true},
 		{"malformed response transient", 200, `not json`, false, true},
@@ -41,6 +44,23 @@ func TestSendClassifiesTelegramResponses(t *testing.T) {
 			}
 			if tc.permanent && !errors.Is(err, ErrPermanent) {
 				t.Fatalf("%v is not permanent", err)
+			}
+		})
+	}
+}
+
+func TestNonJSONClientErrorsArePermanentWithHTTPDiagnostic(t *testing.T) {
+	for _, status := range []int{400, 403} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			s := NewTelegramSender("unit-token", WithHTTPClient(client(roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader("not-json")), Header: make(http.Header), Request: r}, nil
+			}))))
+			err := s.sendOnce(context.Background(), 123, "hello")
+			if !errors.Is(err, ErrPermanent) {
+				t.Fatalf("sendOnce error = %v, want permanent client error", err)
+			}
+			if !strings.Contains(err.Error(), "HTTP "+strconv.Itoa(status)) {
+				t.Fatalf("diagnostic %q omits HTTP status", err)
 			}
 		})
 	}

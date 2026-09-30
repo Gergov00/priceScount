@@ -33,4 +33,4 @@
 - `D:/pricescount-brainstorming-inspector.json`
 - `D:/pricescount-writing-plans-inspector.json`
 
-Subagent-driven-development и TDD будут применены на этапе реализации после design gate; их полная проверка исполнения и релевантных supporting files выполняется перед использованием. Подбор скиллов не является заявлением о закрытии багов.
+В реализации был прочитан executing-plans и выполнен Task 6 как один implementer в текущем checkout по решению контроллера. TDD skill также был прочитан; исправление классификации Notifier началось с добавления таблицы случаев, затем добавлены проверки. Supabase Postgres skill прочитан перед SQL-файлами и DB-тестами. Подбор скиллов не является заявлением о закрытии багов.

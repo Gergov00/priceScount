@@ -47,6 +47,7 @@ func integrationStore(t *testing.T) (*Store, *pgxpool.Pool) {
 		t.Fatal(err)
 	}
 	cfg.ConnConfig.RuntimeParams["search_path"] = quoted + ",public"
+	cfg.ConnConfig.RuntimeParams["application_name"] = schema
 	db, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)

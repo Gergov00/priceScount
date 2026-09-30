@@ -1,6 +1,7 @@
 services:
   rabbitmq:
     image: rabbitmq:3.13-management-alpine
+    hostname: pricescount-rabbitmq
     ports:
       # bound to localhost only — never expose the broker to the network
       - "127.0.0.1:5672:5672"
@@ -8,6 +9,10 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-pricescount}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-pricescount}
+      # Keep this identical to the nodename of any broker data being restored.
+      RABBITMQ_NODENAME: rabbit@pricescount-rabbitmq
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 10s
@@ -111,3 +116,4 @@ services:
 
 volumes:
   postgres_data:
+  rabbitmq_data:

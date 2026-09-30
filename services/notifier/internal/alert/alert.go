@@ -129,6 +129,9 @@ func (s *TelegramSender) sendOnce(ctx context.Context, chatID int64, text string
 	defer resp.Body.Close()
 	responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4097))
 	if readErr != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return &RetryError{Err: fmt.Errorf("read telegram response: %s", sanitize(readErr.Error(), s.token))}
 	}
 	if len(responseBody) > 4096 {
@@ -142,7 +145,11 @@ func (s *TelegramSender) sendOnce(ctx context.Context, chatID int64, text string
 		} `json:"parameters"`
 	}
 	if err := json.Unmarshal(responseBody, &result); err != nil {
-		return &RetryError{Err: fmt.Errorf("invalid telegram response (HTTP %d)", resp.StatusCode)}
+		apiErr := fmt.Errorf("invalid telegram response (HTTP %d)", resp.StatusCode)
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
+			return fmt.Errorf("%w: %v", ErrPermanent, apiErr)
+		}
+		return &RetryError{Err: apiErr}
 	}
 	if resp.StatusCode == http.StatusOK && result.OK {
 		return nil

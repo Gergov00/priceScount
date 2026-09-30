@@ -1,54 +1,55 @@
-# Тесты priceScount
+# Test procedures
 
-Unit-тесты используют реальные функции, HTTP-клиент с httptest и doubles только для внешних операций. Интеграционные тесты запускаются с build tag `integration`, регрессионные проверки незакрытых дефектов — с `regression`.
+The workspace has six Go modules: five services and `shared`. Run unit tests, the integration suite, builds, and vet across all six modules; `go test ./...` from the workspace root does not cross module boundaries.
 
-## Unit-тесты
-
-Из корня workspace:
+## Unit tests
 
 ```powershell
 go test -race -count=1 ./services/bot/... ./services/gateway/... ./services/scheduler/... ./services/extractor/... ./services/notifier/... ./shared/...
 ```
 
-`go test ./...` из корня не пересекает границы модулей этого workspace.
+## PostgreSQL and RabbitMQ integration tests
 
-## Интеграционные тесты
-
-Нужны Go 1.26, рабочий race detector (CGO и C-компилятор), Docker Desktop с Linux containers и PowerShell. Команда создаёт отдельный Compose-проект с уникальным именем, динамическими localhost-портами и тестовыми учётными данными, запускает unit и integration тесты и удаляет свои контейнеры в finally:
+Requires Go 1.26, a working race detector (CGO and a C compiler), Docker Desktop with Linux containers, and PowerShell 7. The runner creates a new Compose project for each invocation, publishes PostgreSQL 16 and RabbitMQ 3.13 on dynamic localhost ports, sets process-local fake test credentials, and removes only that project and its volumes in `finally`:
 
 ```powershell
 ./scripts/test-integration.ps1
 ./scripts/test-integration.ps1 -Coverage
 ```
 
-Профиль покрытия сохраняется в `tests/results/coverage.out` (gitignored):
+The coverage profile is written to the gitignored `tests/results/coverage.out`:
 
 ```powershell
 go tool cover -func=tests/results/coverage.out
 ```
 
-Тесты БД создают отдельную схему на каждый тест, применяют настоящую `migrations/init.sql` и удаляют только созданную схему. Они не очищают общие таблицы. Тесты RabbitMQ используют уникальные имена очередей и удаляют только свои очереди.
+`-Regression` remains as a compatibility alias for `-tags=integration,regression`. Closed defect regressions now run in the ordinary unit or integration set; the alias does not hide or add the only check for any repaired behavior.
 
-Проверяются PostgreSQL lookup/subscription/history lifecycle и ownership, конкурентный upsert товара, конкурентный захват расписания и `SKIP LOCKED`. RabbitMQ проверяет persistent JSON, Ack/Nack и redelivery, ошибки JSON и переподключение publisher. Gateway pipeline соединяет настоящий HTTP handler, PostgreSQL store, RabbitMQ и consumer цены до notify.tasks. Граница скрапера контролируется тестом; реальные Wildberries и Telegram не вызываются.
+The integration suite creates an isolated PostgreSQL schema per DB test and runs the schema migration twice. Upgrade-fixture tests seed the pre-repair `users`, `subscriptions`, `price_history`, and `scheduled_urls` schema, check row preservation and backfill, and verify that duplicate `scheduled_urls.product_id` values fail with an explicit manual-reconciliation error without deleting rows. RabbitMQ tests use unique queues. The Gateway pipeline exercises HTTP → PostgreSQL → RabbitMQ → price consumer → notification outbox. No real Telegram or Wildberries requests are made.
 
-Для своей изолированной инфраструктуры можно запустить вручную:
+When a test explicitly selects the `integration` tag, a missing `TEST_POSTGRES_DSN` or `TEST_RABBITMQ_URL` fails. Example process-local test values for an already-isolated service are:
 
 ```powershell
-$env:TEST_POSTGRES_DSN='postgres://test:test@127.0.0.1:5432/testdb?sslmode=disable'
-$env:TEST_RABBITMQ_URL='amqp://test:test@127.0.0.1:5672/'
+$env:TEST_POSTGRES_DSN='postgres://pricescount_test:pricescount_test@127.0.0.1:5432/pricescount_test?sslmode=disable'
+$env:TEST_RABBITMQ_URL='amqp://pricescount_test:pricescount_test@127.0.0.1:5672/'
 go test -race -count=1 -tags=integration ./services/gateway/... ./services/scheduler/... ./shared/...
 ```
 
-При явном выборе `integration` отсутствующие переменные/недоступная инфраструктура вызывают FAIL, а не тихий skip.
+Do not point these variables at production or shared development data. Each database test owns and drops its generated schema; queue tests own their generated queue names.
 
-## Незакрытые дефекты review
+## Controlled browser and broker recovery
+
+The controlled Chrome cancellation test is opt-in and targets a local `httptest` page, not Wildberries. On Windows, provide the local Chrome executable path:
 
 ```powershell
-./scripts/test-integration.ps1 -Regression
+$env:TEST_CHROME_PATH='C:\Program Files\Google\Chrome\Application\chrome.exe'
+go test -race -count=1 '-tags=integration,browser' ./shared/pkg/marketplace
 ```
 
-Этот режим включает проверки желаемого корректного поведения. До исправления production-кода часть проверок падает: гонка Session, oversized /mylist, потеря публикации алерта, Ack недоставленного уведомления, токен в ошибке транспорта, устаревший alert_state после восстановления подписки и включение paused расписания при force. Они не закрепляют ошибочное поведение как норму и не скрываются через t.Skip.
+The result is meaningful only if that command actually runs rather than reports the test skipped. The Linux CI job does not have Chrome configured and records browser cancellation as outside that job.
 
-Отдельные регрессионные проверки могут уже проходить — это контроль существующей гарантии. Успех стандартного набора не означает закрытия всего review. Перевести регрессионный тест в обычный набор следует вместе с соответствующим исправлением и проверенным red → green.
+Broker data recovery uses the separate, isolated procedure in [BROKER_RECOVERY.md](BROKER_RECOVERY.md): a unique Compose project, named test volume, durable queue, publisher-confirmed persistent message, forced broker recreation with the same nodename, and consumption of the original body before project-only cleanup.
 
-Тесты не гарантируют 100% покрытия всех файлов. Главные функции wiring в cmd, настоящий Chromium, внешняя доставка Telegram, аварийное восстановление всего Compose-приложения и outbox/versioning из ещё не реализованного дизайна требуют отдельного этапа. Полные интеграционные проверки нового дизайна добавляются вместе с его реализацией.
+## CI checks
+
+`.github/workflows/test.yml` runs unit/race and PostgreSQL 16/RabbitMQ 3.13 integration/race tests over all six module paths, then build and vet over all six modules. It also builds all five root-context Docker images with fake credentials and runs the isolated broker recovery procedure. The workflow has no production secrets and does not use the repository `.env` file.

@@ -167,7 +167,7 @@ func TestLongRetryAfterPersistedBeforeRetry(t *testing.T) {
 	}
 }
 
-func TestTransferFailureLogDoesNotExposeToken(t *testing.T) {
+func TestPermanentDLQDiagnosticIsRedacted(t *testing.T) {
 	var output bytes.Buffer
 	old := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&output, nil)))
@@ -186,7 +186,38 @@ func TestTransferFailureLogDoesNotExposeToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	dead, ok := mq.message.(deadEnvelope)
+	if !ok || !strings.Contains(dead.Error, "HTTP 400") || !strings.Contains(dead.Error, "rejected [redacted]") {
+		t.Fatalf("DLQ diagnostic missing safe Telegram error: %#v", mq.message)
+	}
 	if strings.Contains(string(encoded), token) || strings.Contains(output.String(), token) {
-		t.Fatalf("captured error/log contains token: %s %s", encoded, output.String())
+		t.Fatalf("captured DLQ diagnostic/log contains token: %s %s", encoded, output.String())
+	}
+}
+
+func TestTransferFailureEmitsRedactedBrokerDiagnostic(t *testing.T) {
+	var output bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&output, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+	const token = "secret-token"
+	sender := alert.NewTelegramSender(token, alert.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 503, Body: io.NopCloser(strings.NewReader(`{"ok":false,"description":"rejected secret-token"}`)), Header: make(http.Header), Request: r}, nil
+	})}))
+	mq := &fakeMQ{err: errors.New("broker unavailable")}
+	a := &ackRecorder{}
+	New(mq, sender, 0).handle(context.Background(), amqp.Delivery{
+		Acknowledger: a,
+		Body:         []byte(`{"channel":"telegram","target":"7","text":"x"}`),
+	})
+	log := output.String()
+	if !strings.Contains(log, "notification transfer failed") || !strings.Contains(log, "broker unavailable") {
+		t.Fatalf("broker transfer failure diagnostic missing: %q", log)
+	}
+	if strings.Contains(log, token) {
+		t.Fatalf("broker transfer log contains Telegram token: %q", log)
+	}
+	if a.ack || !a.nack || !a.requeue {
+		t.Fatalf("ack/nack/requeue=%v/%v/%v", a.ack, a.nack, a.requeue)
 	}
 }
