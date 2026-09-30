@@ -4,113 +4,72 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/Gergov00/pricescount/shared/pkg/broker"
+	"testing"
+
+	"github.com/Gergov00/pricescount/services/scheduler/internal/store"
 	"github.com/Gergov00/pricescount/shared/pkg/contracts"
 	amqp "github.com/rabbitmq/amqp091-go"
-	"testing"
 )
 
 type ackRecorder struct{ ack, nack, requeue bool }
 
-func (a *ackRecorder) Ack(_ uint64, _ bool) error          { a.ack = true; return nil }
-func (a *ackRecorder) Nack(_ uint64, _ bool, r bool) error { a.nack = true; a.requeue = r; return nil }
-func (a *ackRecorder) Reject(_ uint64, _ bool) error       { return nil }
-
-type fakeMQ struct {
-	published []any
-	err       error
+func (a *ackRecorder) Ack(uint64, bool) error { a.ack = true; return nil }
+func (a *ackRecorder) Nack(_ uint64, _ bool, requeue bool) error {
+	a.nack = true
+	a.requeue = requeue
+	return nil
 }
+func (a *ackRecorder) Reject(uint64, bool) error { return nil }
 
-func (m *fakeMQ) Consume(string, string) (<-chan amqp.Delivery, error) { panic("unused") }
-func (m *fakeMQ) Publish(_ context.Context, q string, v any) error {
-	m.published = append(m.published, v)
-	return m.err
-}
+type fakeMQ struct{ deliveries <-chan amqp.Delivery }
+
+func (m *fakeMQ) Consume(string, string) (<-chan amqp.Delivery, error) { return m.deliveries, nil }
 
 type fakeStore struct {
-	err      error
-	actions  []string
-	active   bool
-	interval int
+	err             error
+	snapshot, force int
+	invalid         bool
 }
 
-func (s *fakeStore) Add(_ context.Context, _, _, _ string, i int) error {
-	s.actions = append(s.actions, "add")
-	s.interval = i
-	return s.err
-}
-func (s *fakeStore) SetActive(_ context.Context, _ string, a bool) error {
-	s.actions = append(s.actions, "pause")
-	s.active = a
-	return s.err
-}
-func (s *fakeStore) SetNextCheck(context.Context, string) error {
-	s.actions = append(s.actions, "resume")
-	return s.err
-}
-func (s *fakeStore) Delete(context.Context, string) error {
-	s.actions = append(s.actions, "delete")
-	return s.err
-}
-func (s *fakeStore) AdvanceNextCheck(context.Context, string) error {
-	s.actions = append(s.actions, "advance")
-	return s.err
-}
-func makeDelivery(t *testing.T, v any, a *ackRecorder) amqp.Delivery {
-	t.Helper()
-	b, e := json.Marshal(v)
-	if e != nil {
-		t.Fatal(e)
+func (s *fakeStore) ApplySnapshot(context.Context, contracts.TrackRequest) error {
+	s.snapshot++
+	if s.invalid {
+		return store.ErrInvalidRequest
 	}
-	return amqp.Delivery{Acknowledger: a, Body: b}
+	return s.err
 }
-func TestConsumerHandle(t *testing.T) {
+func (s *fakeStore) EnqueueForce(context.Context, contracts.TrackRequest) error {
+	s.force++
+	if s.invalid {
+		return store.ErrInvalidRequest
+	}
+	return s.err
+}
+
+func TestConsumerHandleCommitAndErrorClassification(t *testing.T) {
 	tests := []struct {
-		name                           string
-		body                           []byte
-		storeErr, publishErr           error
-		wantAck, wantNack, wantRequeue bool
-	}{
-		{name: "success", body: []byte(`{"action":"add","product_id":"p","url":"u","platform":"wb"}`), wantAck: true},
-		{name: "malformed is dropped", body: []byte(`{`), wantNack: true},
-		{name: "unknown action is dropped", body: []byte(`{"action":"unknown"}`), wantNack: true},
-		{name: "temporary store failure requeues", body: []byte(`{"action":"delete","url":"u"}`), storeErr: errors.New("db"), wantNack: true, wantRequeue: true},
-		{name: "force publish failure requeues", body: []byte(`{"action":"force","product_id":"p","url":"u","platform":"wb"}`), publishErr: errors.New("mq"), wantNack: true, wantRequeue: true},
-	}
+		name, body              string
+		err                     error
+		ack, nack, requeue      bool
+		wantSnapshot, wantForce int
+	}{{name: "snapshot committed", body: `{"action":"set_state"}`, ack: true, wantSnapshot: 1}, {name: "force committed", body: `{"action":"force"}`, ack: true, wantForce: 1}, {name: "malformed dropped", body: `{`, nack: true}, {name: "unknown action dropped", body: `{"action":"add"}`, nack: true}, {name: "invalid command dropped", body: `{"action":"set_state"}`, err: store.ErrInvalidRequest, nack: true, wantSnapshot: 1}, {name: "database failure requeued", body: `{"action":"force"}`, err: errors.New("database unavailable"), nack: true, requeue: true, wantForce: 1}}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			m := &fakeMQ{err: tt.publishErr}
-			s := &fakeStore{err: tt.storeErr}
-			c := New(m, s)
+			var req contracts.TrackRequest
+			if tt.body != "{" {
+				_ = json.Unmarshal([]byte(tt.body), &req)
+			}
+			st := &fakeStore{err: tt.err, invalid: tt.name == "invalid command dropped"}
 			a := &ackRecorder{}
-			d := amqp.Delivery{Acknowledger: a, Body: tt.body}
-			c.handle(context.Background(), d)
-			if a.ack != tt.wantAck || a.nack != tt.wantNack || a.requeue != tt.wantRequeue {
-				t.Fatalf("ack/nack/requeue %v/%v/%v", a.ack, a.nack, a.requeue)
+			raw := []byte(tt.body)
+			c := New(&fakeMQ{}, st)
+			c.handle(context.Background(), amqp.Delivery{Acknowledger: a, Body: raw})
+			if a.ack != tt.ack || a.nack != tt.nack || a.requeue != tt.requeue {
+				t.Fatalf("ack/nack/requeue=%v/%v/%v", a.ack, a.nack, a.requeue)
 			}
-			if tt.name == "success" && s.interval != 1 {
-				t.Fatalf("default interval = %d, want 1", s.interval)
-			}
-			if tt.name == "force publish failure requeues" && len(m.published) != 1 {
-				t.Fatalf("published tasks=%d", len(m.published))
+			if st.snapshot != tt.wantSnapshot || st.force != tt.wantForce {
+				t.Fatalf("store calls snapshot=%d force=%d", st.snapshot, st.force)
 			}
 		})
 	}
-}
-func TestConsumerForceRequestCarriesRequesterAndAdvancesSchedule(t *testing.T) {
-	m := &fakeMQ{}
-	s := &fakeStore{}
-	c := New(m, s)
-	req := contracts.TrackRequest{Action: "force", ProductID: "p", URL: "u", Platform: "wb", ChatID: 42}
-	if err := c.handleForce(context.Background(), req); err != nil {
-		t.Fatal(err)
-	}
-	task, ok := m.published[0].(contracts.ScraperTask)
-	if !ok || !task.Force || task.ChatID != 42 || task.ProductID != "p" {
-		t.Fatalf("force task = %#v", m.published[0])
-	}
-	if len(s.actions) != 1 || s.actions[0] != "advance" {
-		t.Fatalf("store effects = %v", s.actions)
-	}
-	_ = broker.QueueScraperTasks
 }

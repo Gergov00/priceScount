@@ -122,6 +122,20 @@ CREATE TABLE IF NOT EXISTS scheduled_urls (
     check_interval_hours INT         NOT NULL DEFAULT 1,
     active               BOOLEAN     NOT NULL DEFAULT TRUE
 );
+ALTER TABLE scheduled_urls ADD COLUMN IF NOT EXISTS monitor_version BIGINT NOT NULL DEFAULT 0;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM scheduled_urls GROUP BY product_id HAVING COUNT(*) > 1) THEN
+        RAISE EXCEPTION 'scheduled_urls has multiple rows for one product; resolve duplicates before applying scheduler identity constraint';
+    END IF;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduled_urls_product_id ON scheduled_urls(product_id);
+
+CREATE TABLE IF NOT EXISTS processed_force_commands (
+    task_id UUID PRIMARY KEY,
+    product_id UUID NOT NULL,
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Indexes

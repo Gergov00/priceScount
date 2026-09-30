@@ -10,11 +10,12 @@ import (
 	"go.uber.org/fx"
 	"go.uber.org/fx/fxevent"
 
-	"github.com/Gergov00/pricescount/shared/pkg/broker"
 	"github.com/Gergov00/pricescount/services/scheduler/internal/config"
 	"github.com/Gergov00/pricescount/services/scheduler/internal/consumer"
 	"github.com/Gergov00/pricescount/services/scheduler/internal/scheduler"
 	"github.com/Gergov00/pricescount/services/scheduler/internal/store"
+	"github.com/Gergov00/pricescount/shared/pkg/broker"
+	"github.com/Gergov00/pricescount/shared/pkg/outbox"
 )
 
 func main() {
@@ -29,10 +30,12 @@ func main() {
 			store.New,
 			newConsumer,
 			newScheduler,
+			newOutboxWorker,
 		),
 		fx.Invoke(
 			runConsumer,
 			runScheduler,
+			runOutboxWorker,
 		),
 	).Run()
 }
@@ -72,14 +75,21 @@ func newConsumer(mq *broker.Connection, st *store.Store) *consumer.Consumer {
 }
 
 func newScheduler(mq *broker.Connection, st *store.Store, cfg *config.Config) *scheduler.Scheduler {
-	return scheduler.New(mq, st, cfg.CheckInterval)
+	return scheduler.New(st, cfg.CheckInterval)
+}
+
+func newOutboxWorker(st *store.Store, mq *broker.Connection) *outbox.Worker {
+	return outbox.New(st, mq)
 }
 
 func runConsumer(lc fx.Lifecycle, c *consumer.Consumer, s fx.Shutdowner) {
 	ctx, cancel := context.WithCancel(context.Background())
+	var done chan struct{}
 	lc.Append(fx.Hook{
 		OnStart: func(_ context.Context) error {
+			done = make(chan struct{})
 			go func() {
+				defer close(done)
 				if err := c.Run(ctx); err != nil {
 					slog.Error("consumer stopped", "error", err)
 					s.Shutdown(fx.ExitCode(1))
@@ -87,18 +97,29 @@ func runConsumer(lc fx.Lifecycle, c *consumer.Consumer, s fx.Shutdowner) {
 			}()
 			return nil
 		},
-		OnStop: func(_ context.Context) error {
+		OnStop: func(stopCtx context.Context) error {
 			cancel()
-			return nil
+			if done == nil {
+				return nil
+			}
+			select {
+			case <-done:
+				return nil
+			case <-stopCtx.Done():
+				return stopCtx.Err()
+			}
 		},
 	})
 }
 
 func runScheduler(lc fx.Lifecycle, sc *scheduler.Scheduler, s fx.Shutdowner) {
 	ctx, cancel := context.WithCancel(context.Background())
+	var done chan struct{}
 	lc.Append(fx.Hook{
 		OnStart: func(_ context.Context) error {
+			done = make(chan struct{})
 			go func() {
+				defer close(done)
 				if err := sc.Run(ctx); err != nil {
 					slog.Error("scheduler stopped", "error", err)
 					s.Shutdown(fx.ExitCode(1))
@@ -106,9 +127,44 @@ func runScheduler(lc fx.Lifecycle, sc *scheduler.Scheduler, s fx.Shutdowner) {
 			}()
 			return nil
 		},
-		OnStop: func(_ context.Context) error {
+		OnStop: func(stopCtx context.Context) error {
 			cancel()
-			return nil
+			if done == nil {
+				return nil
+			}
+			select {
+			case <-done:
+				return nil
+			case <-stopCtx.Done():
+				return stopCtx.Err()
+			}
 		},
 	})
+}
+
+func runOutboxWorker(lc fx.Lifecycle, worker *outbox.Worker, s fx.Shutdowner) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var done chan struct{}
+	lc.Append(fx.Hook{OnStart: func(context.Context) error {
+		done = make(chan struct{})
+		go func() {
+			defer close(done)
+			if err := worker.Run(ctx); err != nil && ctx.Err() == nil {
+				slog.Error("scheduler outbox worker stopped", "error", err)
+				_ = s.Shutdown(fx.ExitCode(1))
+			}
+		}()
+		return nil
+	}, OnStop: func(stopCtx context.Context) error {
+		cancel()
+		if done == nil {
+			return nil
+		}
+		select {
+		case <-done:
+			return nil
+		case <-stopCtx.Done():
+			return stopCtx.Err()
+		}
+	}})
 }
