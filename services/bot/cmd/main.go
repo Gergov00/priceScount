@@ -46,19 +46,26 @@ func newBot(cfg config.Config, st *state.Store, gw *gateway.Client) (*bot.Bot, e
 
 func runBot(lc fx.Lifecycle, b *bot.Bot, s fx.Shutdowner) {
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 	lc.Append(fx.Hook{
 		OnStart: func(_ context.Context) error {
 			go func() {
+				defer close(done)
 				if err := b.Run(ctx); err != nil {
-					slog.Error("bot stopped", "error", err)
+					slog.Error("bot stopped", "error", err.Error())
 					s.Shutdown(fx.ExitCode(1))
 				}
 			}()
 			return nil
 		},
-		OnStop: func(_ context.Context) error {
+		OnStop: func(stopCtx context.Context) error {
 			cancel()
-			return nil
+			select {
+			case <-done:
+				return nil
+			case <-stopCtx.Done():
+				return stopCtx.Err()
+			}
 		},
 	})
 }

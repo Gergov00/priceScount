@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -13,6 +14,13 @@ import (
 	"github.com/Gergov00/pricescount/services/bot/internal/state"
 )
 
+var lookupSequence atomic.Uint64
+
+type lookupTask struct {
+	id     string
+	cancel context.CancelFunc
+}
+
 func (b *Bot) handleURLSubmit(ctx context.Context, chatID int64, text string) {
 	if !strings.Contains(text, "wildberries.ru") {
 		b.send(chatID, "Пришли ссылку на товар с Wildberries.\n\n"+
@@ -20,25 +28,68 @@ func (b *Bot) handleURLSubmit(ctx context.Context, chatID int64, text string) {
 		return
 	}
 
-	b.api.Request(tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping))
-	b.send(chatID, "Загружаю информацию о товаре...")
-
-	lookupID, err := b.gw.StartLookup(ctx, text)
-	if err != nil {
-		slog.Error("start lookup failed", "url", text, "error", err)
-		b.send(chatID, "Не удалось запустить поиск товара. Проверь ссылку и попробуй снова.")
-		return
-	}
-
+	localID := fmt.Sprintf("bot-%d", lookupSequence.Add(1))
+	b.cancelLookup(chatID)
+	page := b.state.Get(chatID).Page
 	b.state.Set(chatID, &state.Session{
 		Step:     state.StepWaitingLookup,
-		LookupID: lookupID,
+		LookupID: localID,
+		Page:     page,
 	})
-
-	go b.pollLookup(ctx, chatID, lookupID)
+	if err := b.request(tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping)); err != nil {
+		slog.Warn("send typing action failed", "chat_id", chatID, "error", b.safeError(err))
+	}
+	b.send(chatID, "Загружаю информацию о товаре...")
+	lookupCtx, cancel := context.WithCancel(ctx)
+	b.lookupMu.Lock()
+	select {
+	case b.lookupSlots <- struct{}{}:
+		b.activeLookups[chatID] = lookupTask{id: localID, cancel: cancel}
+		b.lookupWG.Add(1)
+	default:
+		b.lookupMu.Unlock()
+		cancel()
+		b.state.CompleteLookup(chatID, localID, state.Session{Step: state.StepIdle, Page: page})
+		b.send(chatID, "Сейчас слишком много активных поисков. Попробуй ещё раз через минуту.")
+		return
+	}
+	b.lookupMu.Unlock()
+	go func() {
+		defer b.lookupWG.Done()
+		defer cancel()
+		defer func() {
+			<-b.lookupSlots
+			b.lookupMu.Lock()
+			if active, ok := b.activeLookups[chatID]; ok && active.id == localID {
+				delete(b.activeLookups, chatID)
+			}
+			b.lookupMu.Unlock()
+		}()
+		lookupID, err := b.gw.StartLookup(lookupCtx, text)
+		if err != nil {
+			if lookupCtx.Err() == nil && b.state.CompleteLookup(chatID, localID, state.Session{Step: state.StepIdle, Page: page}) {
+				slog.Error("start lookup failed", "error", err)
+				b.send(chatID, "Не удалось запустить поиск товара. Проверь ссылку и попробуй снова.")
+			}
+			return
+		}
+		b.pollLookup(lookupCtx, chatID, localID, lookupID)
+	}()
 }
 
-func (b *Bot) pollLookup(ctx context.Context, chatID int64, lookupID string) {
+func (b *Bot) cancelLookup(chatID int64) {
+	b.lookupMu.Lock()
+	task, ok := b.activeLookups[chatID]
+	if ok {
+		delete(b.activeLookups, chatID)
+	}
+	b.lookupMu.Unlock()
+	if ok {
+		task.cancel()
+	}
+}
+
+func (b *Bot) pollLookup(ctx context.Context, chatID int64, localID, lookupID string) {
 	pollCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 
@@ -46,33 +97,31 @@ func (b *Bot) pollLookup(ctx context.Context, chatID int64, lookupID string) {
 	if err != nil {
 		slog.Error("poll lookup failed", "lookup_id", lookupID, "error", err)
 		// only notify if the user is still waiting for this lookup
-		if sess := b.state.Get(chatID); sess.LookupID == lookupID {
-			b.state.Clear(chatID)
+		if ctx.Err() == nil && b.state.CompleteLookup(chatID, localID, state.Session{Step: state.StepIdle}) {
 			b.send(chatID, "Не удалось получить информацию о товаре. Попробуй снова.")
 		}
 		return
 	}
 
 	if result.Status == "failed" {
-		if sess := b.state.Get(chatID); sess.LookupID == lookupID {
-			b.state.Clear(chatID)
+		if ctx.Err() == nil && b.state.CompleteLookup(chatID, localID, state.Session{Step: state.StepIdle}) {
 			b.send(chatID, "Не удалось получить информацию о товаре. Проверь ссылку и попробуй снова.")
 		}
 		return
 	}
 
-	sess := b.state.Get(chatID)
-	if sess.Step != state.StepWaitingLookup || sess.LookupID != lookupID {
-		return // user cancelled or started a new lookup
+	if ctx.Err() != nil {
+		return
 	}
-
-	b.state.Set(chatID, &state.Session{
+	if !b.state.CompleteLookup(chatID, localID, state.Session{
 		Step:         state.StepWaitingMinPrice,
 		LookupID:     lookupID,
 		ProductName:  result.Name,
 		ProductURL:   result.URL,
 		CurrentPrice: result.Price,
-	})
+	}) {
+		return
+	}
 
 	hint := fmt.Sprintf("%.0f", result.Price*0.9)
 	b.send(chatID, fmt.Sprintf(
@@ -122,7 +171,7 @@ func (b *Bot) handleMaxPrice(ctx context.Context, chatID int64, sess *state.Sess
 	}
 	_ = resp
 
-	b.state.Clear(chatID)
+	b.state.Set(chatID, &state.Session{Step: state.StepIdle, Page: sess.Page})
 	b.send(chatID, fmt.Sprintf(
 		"Готово! Слежу за «%s»\n\n%s\n\nДиапазон: %.0f — %.0f ₽\n\nУведомлю если цена выйдет за границы.",
 		sess.ProductName, sess.ProductURL, sess.MinPrice, price,

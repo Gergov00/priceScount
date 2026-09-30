@@ -23,11 +23,13 @@ func (b *Bot) startEditSubscription(ctx context.Context, chatID int64, subID str
 		oldMax = *sub.MaxPrice
 	}
 
+	current := b.state.Get(chatID)
 	b.state.Set(chatID, &state.Session{
 		Step:         state.StepEditingMinPrice,
 		EditingSubID: subID,
 		OldMinPrice:  oldMin,
 		OldMaxPrice:  oldMax,
+		Page:         current.Page,
 	})
 	b.send(chatID, fmt.Sprintf(
 		"Редактирую %q\n\nУкажи новую минимальную цену (сейчас: %.0f ₽):",
@@ -67,7 +69,7 @@ func (b *Bot) handleEditMaxPrice(ctx context.Context, chatID int64, sess *state.
 		return
 	}
 
-	b.state.Clear(chatID)
+	b.state.Set(chatID, &state.Session{Step: state.StepIdle, Page: sess.Page})
 	b.send(chatID, fmt.Sprintf(
 		"Готово! Новый диапазон: %.0f — %.0f ₽\n\n/mylist — посмотреть все товары",
 		sess.MinPrice, price,

@@ -1,6 +1,19 @@
 package marketplace
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
+
+func TestCancelledFetchProductDoesNotStartBrowser(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	client := &WBClient{allocCtx: context.Background(), allocCancel: func() {}}
+	_, err := client.FetchProduct(ctx, "https://www.wildberries.ru/catalog/123/detail.aspx")
+	if err != context.Canceled {
+		t.Fatalf("FetchProduct error = %v, want context.Canceled", err)
+	}
+}
 
 func TestParseWBPrice(t *testing.T) {
 	t.Parallel()

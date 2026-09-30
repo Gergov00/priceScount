@@ -23,12 +23,16 @@ type WBClient struct {
 }
 
 func NewWBClient() *WBClient {
+	return newWBClient("chromium-browser")
+}
+
+func newWBClient(execPath string) *WBClient {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.NoSandbox,
 		chromedp.DisableGPU,
 		chromedp.Flag("disable-dev-shm-usage", true),
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
-		chromedp.ExecPath("chromium-browser"),
+		chromedp.ExecPath(execPath),
 		chromedp.UserAgent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
 	)
 	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
@@ -41,6 +45,9 @@ func (c *WBClient) Close() {
 }
 
 func (c *WBClient) FetchProduct(ctx context.Context, rawURL string) (*Product, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	m := wbProductIDRe.FindStringSubmatch(rawURL)
 	if m == nil {
 		return nil, fmt.Errorf("invalid wildberries url")
@@ -48,16 +55,23 @@ func (c *WBClient) FetchProduct(ctx context.Context, rawURL string) (*Product, e
 	nmID := m[1]
 	pageURL := "https://www.wildberries.ru/catalog/" + nmID + "/detail.aspx"
 
+	return c.fetchPage(ctx, pageURL, nmID)
+}
+
+func (c *WBClient) fetchPage(parentCtx context.Context, pageURL, nmID string) (*Product, error) {
+	if err := parentCtx.Err(); err != nil {
+		return nil, err
+	}
 	bCtx, bCancel := chromedp.NewContext(c.allocCtx,
 		chromedp.WithLogf(func(format string, args ...interface{}) {}),
 	)
 	defer bCancel()
-
-	tCtx, tCancel := context.WithTimeout(bCtx, 40*time.Second)
-	defer tCancel()
-
+	stopCancel := context.AfterFunc(parentCtx, bCancel)
+	defer stopCancel()
+	ctx, timeoutCancel := context.WithTimeout(bCtx, 40*time.Second)
+	defer timeoutCancel()
 	var jsResult string
-	if err := chromedp.Run(tCtx,
+	if err := chromedp.Run(ctx,
 		chromedp.Navigate(pageURL),
 		chromedp.WaitReady("body", chromedp.ByQuery),
 		chromedp.Sleep(7*time.Second),
@@ -86,6 +100,9 @@ func (c *WBClient) FetchProduct(ctx context.Context, rawURL string) (*Product, e
 			};
 		})())`, &jsResult),
 	); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("wb fetch: %w", err)
 	}
 

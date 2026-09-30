@@ -9,10 +9,10 @@ import (
 	"go.uber.org/fx"
 	"go.uber.org/fx/fxevent"
 
-	"github.com/Gergov00/pricescount/shared/pkg/broker"
-	"github.com/Gergov00/pricescount/shared/pkg/marketplace"
 	"github.com/Gergov00/pricescount/services/extractor/internal/config"
 	"github.com/Gergov00/pricescount/services/extractor/internal/consumer"
+	"github.com/Gergov00/pricescount/shared/pkg/broker"
+	"github.com/Gergov00/pricescount/shared/pkg/marketplace"
 )
 
 func main() {
@@ -67,10 +67,12 @@ func newConsumer(mq *broker.Connection, wb *marketplace.WBClient) *consumer.Cons
 
 func runConsumer(lc fx.Lifecycle, c *consumer.Consumer, s fx.Shutdowner) {
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 	lc.Append(fx.Hook{
 		OnStart: func(_ context.Context) error {
 			slog.Info("extractor service started")
 			go func() {
+				defer close(done)
 				if err := c.Run(ctx); err != nil {
 					slog.Error("consumer stopped", "error", err)
 					s.Shutdown(fx.ExitCode(1))
@@ -78,9 +80,14 @@ func runConsumer(lc fx.Lifecycle, c *consumer.Consumer, s fx.Shutdowner) {
 			}()
 			return nil
 		},
-		OnStop: func(_ context.Context) error {
+		OnStop: func(stopCtx context.Context) error {
 			cancel()
-			return nil
+			select {
+			case <-done:
+				return nil
+			case <-stopCtx.Done():
+				return fmt.Errorf("waiting for extractor consumer shutdown: %w", stopCtx.Err())
+			}
 		},
 	})
 }
