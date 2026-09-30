@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -51,5 +52,25 @@ func TestOpenPublisherCancellationWithStalledPeer(t *testing.T) {
 	case <-accepted:
 	case <-time.After(time.Second):
 		t.Fatal("server did not accept publisher TCP connection")
+	}
+}
+
+func TestRegisterPublisherSocketAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	local, peer := net.Pipe()
+	defer peer.Close()
+	var mu sync.Mutex
+	var socket net.Conn
+	var timer *time.Timer
+	var timerDone chan struct{}
+	if err := registerPublisherSocket(ctx, local, &mu, &socket, &timer, &timerDone); err == nil {
+		t.Fatal("registerPublisherSocket() error=nil for canceled context")
+	}
+	if socket != nil {
+		t.Fatal("canceled connection was published as the registered socket")
+	}
+	if _, err := peer.Write([]byte("write after cancellation")); err == nil {
+		t.Fatal("registered socket remained open after cancellation")
 	}
 }

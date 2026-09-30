@@ -136,13 +136,14 @@ func (c *Connection) openPublisher(ctx context.Context) (*amqp.Connection, *amqp
 	}()
 	config := amqp.Config{Dial: func(network, addr string) (net.Conn, error) {
 		conn, err := (&net.Dialer{Timeout: dialTimeout}).DialContext(ctx, network, addr)
-		if err == nil {
-			netMu.Lock()
-			netConn = conn
-			_ = conn.SetDeadline(time.Now().Add(dialTimeout))
-			timerDone = make(chan struct{})
-			setupTimer = time.AfterFunc(dialTimeout, func() { defer close(timerDone); _ = conn.Close() })
-			netMu.Unlock()
+		if err != nil {
+			if conn != nil {
+				_ = conn.Close()
+			}
+			return nil, err
+		}
+		if err := registerPublisherSocket(ctx, conn, &netMu, &netConn, &setupTimer, &timerDone); err != nil {
+			return nil, err
 		}
 		return conn, err
 	}}
@@ -192,6 +193,25 @@ func (c *Connection) openPublisher(ctx context.Context) (*amqp.Connection, *amqp
 	c.returns = ch.NotifyReturn(make(chan amqp.Return, 1))
 	c.mu.Unlock()
 	return conn, ch, nil
+}
+
+func registerPublisherSocket(ctx context.Context, conn net.Conn, mu *sync.Mutex, socket *net.Conn, timer **time.Timer, timerDone *chan struct{}) error {
+	mu.Lock()
+	defer mu.Unlock()
+	*socket = conn
+	if err := ctx.Err(); err != nil {
+		*socket = nil
+		_ = conn.Close()
+		return err
+	}
+	if err := conn.SetDeadline(time.Now().Add(dialTimeout)); err != nil {
+		*socket = nil
+		_ = conn.Close()
+		return err
+	}
+	*timerDone = make(chan struct{})
+	*timer = time.AfterFunc(dialTimeout, func() { defer close(*timerDone); _ = conn.Close() })
+	return nil
 }
 
 func (c *Connection) DeclareQueue(name string) error {
