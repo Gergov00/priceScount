@@ -15,6 +15,43 @@ import (
 
 var wbProductIDRe = regexp.MustCompile(`wildberries\.ru/catalog/(\d+)`)
 
+const wbPageDataJS = `JSON.stringify((function() {
+	var priceSelectors = [
+		'[class*="mo-typography_colors_danger"]',
+		'h3[class*="mo-typography_color_danger"]',
+		'[class*="mo-typography_color_danger"]',
+		'[class*="priceBlockFinalPrice"]',
+		'ins.price-block__final-price',
+		'.price-block__final-price',
+		'[class*="price-block__final-price"]',
+		'[class*="finalPrice"]'
+	];
+	function isExcludedPrice(el) {
+		var classes = typeof el.className === 'string' ? el.className : '';
+		return classes.indexOf('priceBlockOldPrice') !== -1 ||
+			classes.indexOf('mo-typography_modifier_strikethrough') !== -1;
+	}
+	var priceEl = null;
+	for (var i = 0; i < priceSelectors.length && !priceEl; i++) {
+		var candidates = document.querySelectorAll(priceSelectors[i]);
+		for (var j = 0; j < candidates.length; j++) {
+			if (!isExcludedPrice(candidates[j]) && candidates[j].innerText.trim()) {
+				priceEl = candidates[j];
+				break;
+			}
+		}
+	}
+	var nameEl = document.querySelector('[class*="productTitle"]') ||
+		 document.querySelector('h1') ||
+		 document.querySelector('h2[class*="mo-typography_color_primary"]');
+	return {
+		price: priceEl ? priceEl.innerText.trim() : '',
+		name:  nameEl ? nameEl.innerText.trim() : '',
+		title: document.title,
+		url:   location.href
+	};
+})())`
+
 // WBClient fetches product data from Wildberries using a headless browser.
 // Stores allocCtx as part of the service lifecycle — Chrome process runs until Close().
 type WBClient struct {
@@ -75,30 +112,7 @@ func (c *WBClient) fetchPage(parentCtx context.Context, pageURL, nmID string) (*
 		chromedp.Navigate(pageURL),
 		chromedp.WaitReady("body", chromedp.ByQuery),
 		chromedp.Sleep(7*time.Second),
-		chromedp.Evaluate(`JSON.stringify((function() {
-			var priceSelectors = [
-				'h3[class*="mo-typography_color_danger"]',
-				'[class*="mo-typography_color_danger"]',
-				'ins.price-block__final-price',
-				'.price-block__final-price',
-				'[class*="price-block__final-price"]',
-				'[class*="finalPrice"]'
-			];
-			var priceEl = null;
-			for (var i = 0; i < priceSelectors.length; i++) {
-				priceEl = document.querySelector(priceSelectors[i]);
-				if (priceEl && priceEl.innerText.trim()) break;
-			}
-			var nameEl = document.querySelector('[class*="productTitle"]') ||
-			             document.querySelector('h1') ||
-			             document.querySelector('h2[class*="mo-typography_color_primary"]');
-			return {
-				price: priceEl ? priceEl.innerText.trim() : '',
-				name:  nameEl ? nameEl.innerText.trim() : '',
-				title: document.title,
-				url:   location.href
-			};
-		})())`, &jsResult),
+		chromedp.Evaluate(wbPageDataJS, &jsResult),
 	); err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
