@@ -40,34 +40,45 @@ func New(mq MQ, wb Fetcher) *Consumer {
 
 // Run starts both consumer goroutines and blocks until ctx is cancelled or either fails.
 func (c *Consumer) Run(ctx context.Context) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
 
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		if err := c.runQueue(ctx, broker.QueueLookupTasks, "extractor-lookup", 1); err != nil {
+		if err := c.runQueue(runCtx, broker.QueueLookupTasks, "extractor-lookup", 1); err != nil {
 			errCh <- fmt.Errorf("lookup consumer: %w", err)
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		if err := c.runQueue(ctx, broker.QueueScraperTasks, "extractor-scraper", 2); err != nil {
+		if err := c.runQueue(runCtx, broker.QueueScraperTasks, "extractor-scraper", 2); err != nil {
 			errCh <- fmt.Errorf("scraper consumer: %w", err)
 		}
 	}()
 
-	go func() {
-		wg.Wait()
-		close(errCh)
-	}()
-
+	var firstErr error
+	select {
+	case firstErr = <-errCh:
+		if firstErr != nil {
+			cancel()
+		}
+	case <-ctx.Done():
+		cancel()
+	}
+	wg.Wait()
+	close(errCh)
 	for err := range errCh {
-		if err != nil {
-			return err
+		if firstErr == nil && err != nil {
+			firstErr = err
 		}
 	}
-	return nil
+	if ctx.Err() != nil {
+		return nil
+	}
+	return firstErr
 }
 
 func (c *Consumer) runQueue(ctx context.Context, queue, consumerTag string, prefetch int) error {
@@ -83,7 +94,13 @@ func (c *Consumer) runQueue(ctx context.Context, queue, consumerTag string, pref
 			return nil
 		case d, ok := <-deliveries:
 			if !ok {
+				if ctx.Err() != nil {
+					return nil
+				}
 				return fmt.Errorf("delivery channel closed: %s", queue)
+			}
+			if ctx.Err() != nil {
+				return nil
 			}
 			c.handle(ctx, d, queue)
 		}
@@ -100,16 +117,24 @@ func (c *Consumer) handle(ctx context.Context, d amqp.Delivery, queue string) {
 }
 
 func (c *Consumer) handleLookup(ctx context.Context, d amqp.Delivery) {
+	if ctx.Err() != nil {
+		return
+	}
 	var task contracts.LookupTask
 	if err := json.Unmarshal(d.Body, &task); err != nil {
 		slog.Error("malformed lookup task, dropping", "error", err)
-		d.Nack(false, false)
+		if err := d.Nack(false, false); err != nil {
+			slog.Warn("nack malformed lookup failed", "error", err)
+		}
 		return
 	}
 
 	log := slog.With("task_id", task.TaskID, "lookup_id", task.LookupID, "url", task.URL)
 
 	product, err := c.fetch(ctx, task.Platform, task.URL)
+	if ctx.Err() != nil {
+		return
+	}
 	result := contracts.PriceResult{
 		TaskID:    task.TaskID,
 		LookupID:  task.LookupID,
@@ -130,23 +155,39 @@ func (c *Consumer) handleLookup(ctx context.Context, d amqp.Delivery) {
 
 	if err := c.mq.Publish(ctx, broker.QueuePriceResults, result); err != nil {
 		log.Error("publish lookup result failed, requeuing", "error", err)
-		d.Nack(false, true)
+		if ctx.Err() == nil {
+			if nackErr := d.Nack(false, true); nackErr != nil {
+				log.Error("nack lookup task failed", "error", nackErr)
+			}
+		}
 		return
 	}
-	d.Ack(false)
+	if ctx.Err() == nil {
+		if ackErr := d.Ack(false); ackErr != nil {
+			log.Error("ack lookup task failed", "error", ackErr)
+		}
+	}
 }
 
 func (c *Consumer) handleScraper(ctx context.Context, d amqp.Delivery) {
+	if ctx.Err() != nil {
+		return
+	}
 	var task contracts.ScraperTask
 	if err := json.Unmarshal(d.Body, &task); err != nil {
 		slog.Error("malformed scraper task, dropping", "error", err)
-		d.Nack(false, false)
+		if err := d.Nack(false, false); err != nil {
+			slog.Warn("nack malformed scraper task failed", "error", err)
+		}
 		return
 	}
 
 	log := slog.With("task_id", task.TaskID, "product_id", task.ProductID, "url", task.URL)
 
 	product, err := c.fetch(ctx, task.Platform, task.URL)
+	if ctx.Err() != nil {
+		return
+	}
 	result := contracts.PriceResult{
 		TaskID:    task.TaskID,
 		ProductID: task.ProductID,
@@ -168,10 +209,18 @@ func (c *Consumer) handleScraper(ctx context.Context, d amqp.Delivery) {
 
 	if err := c.mq.Publish(ctx, broker.QueuePriceResults, result); err != nil {
 		log.Error("publish scraper result failed, requeuing", "error", err)
-		d.Nack(false, true)
+		if ctx.Err() == nil {
+			if nackErr := d.Nack(false, true); nackErr != nil {
+				log.Error("nack scraper task failed", "error", nackErr)
+			}
+		}
 		return
 	}
-	d.Ack(false)
+	if ctx.Err() == nil {
+		if ackErr := d.Ack(false); ackErr != nil {
+			log.Error("ack scraper task failed", "error", ackErr)
+		}
+	}
 }
 
 func (c *Consumer) fetch(ctx context.Context, plat, url string) (*marketplace.Product, error) {

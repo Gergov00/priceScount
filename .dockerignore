@@ -1,0 +1,11 @@
+.git
+.env
+.env.*
+!.env.example
+.superpowers
+.claude
+.vscode
+tests/results
+*.exe
+*.test
+coverage.*

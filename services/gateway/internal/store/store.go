@@ -40,17 +40,6 @@ type LookupResult struct {
 	Error  string
 }
 
-func (s *Store) CreateLookup(ctx context.Context, id, url string) error {
-	_, err := s.db.Exec(ctx,
-		`INSERT INTO lookup_requests(id, url) VALUES($1, $2)`,
-		id, url,
-	)
-	if err != nil {
-		return fmt.Errorf("create lookup: %w", err)
-	}
-	return nil
-}
-
 func (s *Store) GetLookup(ctx context.Context, id string) (*LookupResult, error) {
 	var r LookupResult
 	var name, errStr *string
@@ -75,32 +64,6 @@ func (s *Store) GetLookup(ctx context.Context, id string) (*LookupResult, error)
 		r.Error = *errStr
 	}
 	return &r, nil
-}
-
-func (s *Store) CompleteLookup(ctx context.Context, lookupID, name string, price float64) error {
-	// Completed lookups get a longer TTL: the user may take a while to answer
-	// the min/max price questions before the subscription is created.
-	_, err := s.db.Exec(ctx,
-		`UPDATE lookup_requests
-		 SET status='done', name=$2, price=$3, expires_at = NOW() + INTERVAL '1 hour'
-		 WHERE id=$1`,
-		lookupID, name, price,
-	)
-	if err != nil {
-		return fmt.Errorf("complete lookup: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) FailLookup(ctx context.Context, lookupID, errMsg string) error {
-	_, err := s.db.Exec(ctx,
-		`UPDATE lookup_requests SET status='failed', error=$2 WHERE id=$1`,
-		lookupID, errMsg,
-	)
-	if err != nil {
-		return fmt.Errorf("fail lookup: %w", err)
-	}
-	return nil
 }
 
 func (s *Store) DeleteExpiredLookups(ctx context.Context) (int64, error) {
@@ -189,23 +152,6 @@ type Subscription struct {
 	Paused      bool
 }
 
-func (s *Store) CreateSubscription(ctx context.Context, userID, productID string, minPrice, maxPrice float64) (string, error) {
-	var id string
-	err := s.db.QueryRow(ctx,
-		`INSERT INTO subscriptions(user_id, product_id, min_price, max_price)
-		 VALUES($1, $2, $3, $4)
-		 ON CONFLICT(user_id, product_id) DO UPDATE
-		   SET min_price=EXCLUDED.min_price, max_price=EXCLUDED.max_price,
-		       active=true, paused=false
-		 RETURNING id`,
-		userID, productID, minPrice, maxPrice,
-	).Scan(&id)
-	if err != nil {
-		return "", fmt.Errorf("create subscription: %w", err)
-	}
-	return id, nil
-}
-
 func (s *Store) UserSubscriptions(ctx context.Context, userID string) ([]Subscription, error) {
 	rows, err := s.db.Query(ctx,
 		`SELECT s.id, s.product_id, p.name, p.url, s.min_price, s.max_price, s.paused
@@ -251,78 +197,12 @@ func (s *Store) GetSubscription(ctx context.Context, subID, userID string) (*Sub
 	return &sub, nil
 }
 
-// SubCounts reports how many subscriptions a product still has: total active
-// ones and the subset that is not paused. Gateway uses this to decide whether
-// pausing/deleting one user's subscription should stop monitoring the URL.
-type SubCounts struct {
-	Active   int // active = true, paused or not
-	Watching int // active = true AND paused = false
-}
-
-func (s *Store) ProductSubCounts(ctx context.Context, productID string) (SubCounts, error) {
-	var c SubCounts
-	err := s.db.QueryRow(ctx,
-		`SELECT COUNT(*), COUNT(*) FILTER (WHERE paused = false)
-		 FROM subscriptions
-		 WHERE product_id = $1 AND active = true`,
-		productID,
-	).Scan(&c.Active, &c.Watching)
-	if err != nil {
-		return SubCounts{}, fmt.Errorf("product sub counts: %w", err)
-	}
-	return c, nil
-}
-
-func (s *Store) PauseSubscription(ctx context.Context, subID, userID string) error {
-	_, err := s.db.Exec(ctx,
-		`UPDATE subscriptions SET paused=true WHERE id=$1 AND user_id=$2`,
-		subID, userID,
-	)
-	return err
-}
-
-func (s *Store) ResumeSubscription(ctx context.Context, subID, userID string) error {
-	_, err := s.db.Exec(ctx,
-		`UPDATE subscriptions SET paused=false WHERE id=$1 AND user_id=$2`,
-		subID, userID,
-	)
-	return err
-}
-
-func (s *Store) UpdateThresholds(ctx context.Context, subID, userID string, minPrice, maxPrice float64) error {
-	// New thresholds mean the previous alert direction is stale — reset it.
-	_, err := s.db.Exec(ctx,
-		`UPDATE subscriptions SET min_price=$3, max_price=$4, alert_state='' WHERE id=$1 AND user_id=$2`,
-		subID, userID, minPrice, maxPrice,
-	)
-	return err
-}
-
-func (s *Store) DeleteSubscription(ctx context.Context, subID, userID string) error {
-	_, err := s.db.Exec(ctx,
-		`UPDATE subscriptions SET active=false WHERE id=$1 AND user_id=$2`,
-		subID, userID,
-	)
-	return err
-}
-
 // ─── Price history ────────────────────────────────────────────────────────────
 
 type PricePoint struct {
 	Price     float64
 	Currency  string
 	ScrapedAt time.Time
-}
-
-func (s *Store) SavePrice(ctx context.Context, productID string, price float64, currency string, scrapedAt time.Time) error {
-	_, err := s.db.Exec(ctx,
-		`INSERT INTO price_history(product_id, price, currency, scraped_at) VALUES($1, $2, $3, $4)`,
-		productID, price, currency, scrapedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("save price: %w", err)
-	}
-	return nil
 }
 
 // DeleteOldPriceHistory removes price points older than the retention window.
@@ -357,96 +237,4 @@ func (s *Store) PriceHistory(ctx context.Context, productID string, limit int) (
 		points = append(points, p)
 	}
 	return points, rows.Err()
-}
-
-// ─── Scheduler resync ────────────────────────────────────────────────────────
-
-// ActiveProduct is a distinct product that has at least one active non-paused subscription.
-type ActiveProduct struct {
-	ProductID string
-	URL       string
-	Platform  string
-}
-
-// AllActiveProducts returns one entry per product that has at least one active,
-// non-paused subscription. Used on gateway startup to resync the scheduler.
-func (s *Store) AllActiveProducts(ctx context.Context) ([]ActiveProduct, error) {
-	rows, err := s.db.Query(ctx,
-		`SELECT DISTINCT p.id, p.url, p.platform
-		 FROM subscriptions s
-		 JOIN products p ON p.id = s.product_id
-		 WHERE s.active = true AND s.paused = false`,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("all active products: %w", err)
-	}
-	defer rows.Close()
-
-	var products []ActiveProduct
-	for rows.Next() {
-		var p ActiveProduct
-		if err := rows.Scan(&p.ProductID, &p.URL, &p.Platform); err != nil {
-			return nil, fmt.Errorf("scan active product: %w", err)
-		}
-		products = append(products, p)
-	}
-	return products, rows.Err()
-}
-
-// ─── Threshold checking ───────────────────────────────────────────────────────
-
-// ProductSub is an active non-paused subscription with its alert deduplication
-// state. AlertState holds the direction of the last alert sent ("up", "down")
-// or "" when the price was last seen inside the range.
-type ProductSub struct {
-	SubID       string
-	ChatID      int64
-	ProductName string
-	ProductURL  string
-	MinPrice    float64
-	MaxPrice    float64
-	AlertState  string
-}
-
-// ProductSubscriptions returns all active non-paused subscriptions for a product.
-func (s *Store) ProductSubscriptions(ctx context.Context, productID string) ([]ProductSub, error) {
-	rows, err := s.db.Query(ctx,
-		`SELECT s.id, u.chat_id, p.name, p.url,
-		        COALESCE(s.min_price, 0), COALESCE(s.max_price, 0), s.alert_state
-		 FROM subscriptions s
-		 JOIN users u ON u.id = s.user_id
-		 JOIN products p ON p.id = s.product_id
-		 WHERE s.product_id = $1
-		   AND s.active = true
-		   AND s.paused = false`,
-		productID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("product subscriptions: %w", err)
-	}
-	defer rows.Close()
-
-	var subs []ProductSub
-	for rows.Next() {
-		var sub ProductSub
-		if err := rows.Scan(&sub.SubID, &sub.ChatID, &sub.ProductName, &sub.ProductURL,
-			&sub.MinPrice, &sub.MaxPrice, &sub.AlertState); err != nil {
-			return nil, fmt.Errorf("scan product subscription: %w", err)
-		}
-		subs = append(subs, sub)
-	}
-	return subs, rows.Err()
-}
-
-// SetAlertState records the direction of the last alert ("up", "down" or "")
-// so repeated scrapes with the price still out of range do not re-alert.
-func (s *Store) SetAlertState(ctx context.Context, subID, alertState string) error {
-	_, err := s.db.Exec(ctx,
-		`UPDATE subscriptions SET alert_state=$2 WHERE id=$1`,
-		subID, alertState,
-	)
-	if err != nil {
-		return fmt.Errorf("set alert state: %w", err)
-	}
-	return nil
 }

@@ -13,10 +13,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
-	"github.com/Gergov00/pricescount/shared/pkg/broker"
-	"github.com/Gergov00/pricescount/shared/pkg/contracts"
-	"github.com/Gergov00/pricescount/shared/pkg/platform"
 	"github.com/Gergov00/pricescount/services/gateway/internal/store"
+	"github.com/Gergov00/pricescount/shared/pkg/platform"
 )
 
 // Store is the persistence interface required by Handler.
@@ -31,26 +29,20 @@ type Store interface {
 	CreateSubscription(ctx context.Context, userID, productID string, minPrice, maxPrice float64) (string, error)
 	UserSubscriptions(ctx context.Context, userID string) ([]store.Subscription, error)
 	GetSubscription(ctx context.Context, subID, userID string) (*store.Subscription, error)
-	ProductSubCounts(ctx context.Context, productID string) (store.SubCounts, error)
 	PauseSubscription(ctx context.Context, subID, userID string) error
 	ResumeSubscription(ctx context.Context, subID, userID string) error
 	UpdateThresholds(ctx context.Context, subID, userID string, minPrice, maxPrice float64) error
 	DeleteSubscription(ctx context.Context, subID, userID string) error
+	QueueForce(ctx context.Context, subID, userID string, chatID int64) (string, error)
 	PriceHistory(ctx context.Context, productID string, limit int) ([]store.PricePoint, error)
-}
-
-// Publisher is the messaging interface required by Handler.
-type Publisher interface {
-	Publish(ctx context.Context, queue string, v any) error
 }
 
 type Handler struct {
 	store Store
-	mq    Publisher
 }
 
-func New(st Store, mq Publisher) *Handler {
-	return &Handler{store: st, mq: mq}
+func New(st Store) *Handler {
+	return &Handler{store: st}
 }
 
 func (h *Handler) Register(r *gin.Engine) {
@@ -112,18 +104,6 @@ func (h *Handler) postLookup(c *gin.Context) {
 		return
 	}
 
-	task := contracts.LookupTask{
-		TaskID:   uuid.New().String(),
-		LookupID: lookupID,
-		URL:      normalURL,
-		Platform: plat,
-	}
-	if err := h.mq.Publish(c.Request.Context(), broker.QueueLookupTasks, task); err != nil {
-		slog.Error("publish lookup task", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-		return
-	}
-
 	c.JSON(http.StatusAccepted, gin.H{"lookup_id": lookupID})
 }
 
@@ -179,7 +159,16 @@ func (h *Handler) postSubscription(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	lookup, err := h.store.GetLookup(ctx, req.LookupID)
-	if err != nil || lookup.Status != store.LookupDone {
+	if errors.Is(err, store.ErrNotFound) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "lookup not found or not completed"})
+		return
+	}
+	if err != nil {
+		slog.Error("get lookup for subscription", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+	if lookup.Status != store.LookupDone {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "lookup not found or not completed"})
 		return
 	}
@@ -203,21 +192,6 @@ func (h *Handler) postSubscription(c *gin.Context) {
 	subID, err := h.store.CreateSubscription(ctx, userID, productID, req.MinPrice, req.MaxPrice)
 	if err != nil {
 		slog.Error("create subscription", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-		return
-	}
-
-	// The subscription is saved, but without this message the scheduler never
-	// monitors it. Surface the failure so the client retries (the create is
-	// an idempotent upsert).
-	if err := h.mq.Publish(ctx, broker.QueueTrackRequests, contracts.TrackRequest{
-		Action:        "add",
-		ProductID:     productID,
-		URL:           lookup.URL,
-		Platform:      plat,
-		IntervalHours: 1,
-	}); err != nil {
-		slog.Error("publish track request", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
@@ -285,36 +259,27 @@ func (h *Handler) patchSubscription(c *gin.Context) {
 		return
 	}
 
-	sub, err := h.store.GetSubscription(ctx, subID, userID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "subscription not found"})
-		return
-	}
-
-	var trackAction string
 	switch req.Action {
 	case "pause":
 		if err := h.store.PauseSubscription(ctx, subID, userID); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "subscription not found"})
+				return
+			}
+			slog.Error("pause subscription", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 			return
-		}
-		// The scheduler entry is shared by everyone tracking this URL —
-		// stop monitoring only when no one is watching anymore.
-		watching, err := h.productStillWatched(ctx, sub.ProductID)
-		if err != nil {
-			slog.Error("product sub counts", "error", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-			return
-		}
-		if !watching {
-			trackAction = "pause"
 		}
 	case "resume":
 		if err := h.store.ResumeSubscription(ctx, subID, userID); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "subscription not found"})
+				return
+			}
+			slog.Error("resume subscription", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 			return
 		}
-		trackAction = "resume"
 	case "edit":
 		if req.MinPrice == nil || req.MaxPrice == nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "min_price and max_price are required for edit"})
@@ -325,26 +290,17 @@ func (h *Handler) patchSubscription(c *gin.Context) {
 			return
 		}
 		if err := h.store.UpdateThresholds(ctx, subID, userID, *req.MinPrice, *req.MaxPrice); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "subscription not found"})
+				return
+			}
+			slog.Error("update thresholds", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 			return
 		}
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "action must be pause, resume, or edit"})
 		return
-	}
-
-	if trackAction != "" {
-		plat, _ := platform.Detect(sub.ProductURL)
-		if err := h.mq.Publish(ctx, broker.QueueTrackRequests, contracts.TrackRequest{
-			Action:    trackAction,
-			ProductID: sub.ProductID,
-			URL:       sub.ProductURL,
-			Platform:  plat,
-		}); err != nil {
-			slog.Error("publish track request", "action", trackAction, "error", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-			return
-		}
 	}
 
 	c.Status(http.StatusNoContent)
@@ -372,47 +328,14 @@ func (h *Handler) deleteSubscription(c *gin.Context) {
 		return
 	}
 
-	sub, err := h.store.GetSubscription(ctx, subID, userID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "subscription not found"})
-		return
-	}
-
 	if err := h.store.DeleteSubscription(ctx, subID, userID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "subscription not found"})
+			return
+		}
 		slog.Error("delete subscription", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
-	}
-
-	// Other users may still track the same URL — only drop the scheduler
-	// entry when no active subscriptions remain at all, and merely pause it
-	// when the rest are paused.
-	counts, err := h.store.ProductSubCounts(ctx, sub.ProductID)
-	if err != nil {
-		slog.Error("product sub counts", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-		return
-	}
-	trackAction := ""
-	switch {
-	case counts.Active == 0:
-		trackAction = "delete"
-	case counts.Watching == 0:
-		trackAction = "pause"
-	}
-
-	if trackAction != "" {
-		plat, _ := platform.Detect(sub.ProductURL)
-		if err := h.mq.Publish(ctx, broker.QueueTrackRequests, contracts.TrackRequest{
-			Action:    trackAction,
-			ProductID: sub.ProductID,
-			URL:       sub.ProductURL,
-			Platform:  plat,
-		}); err != nil {
-			slog.Error("publish track request", "action", trackAction, "error", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-			return
-		}
 	}
 
 	c.Status(http.StatusNoContent)
@@ -437,8 +360,13 @@ func (h *Handler) getHistory(c *gin.Context) {
 	}
 
 	sub, err := h.store.GetSubscription(ctx, subID, userID)
-	if err != nil {
+	if errors.Is(err, store.ErrNotFound) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "subscription not found"})
+		return
+	}
+	if err != nil {
+		slog.Error("get subscription", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
 
@@ -473,21 +401,12 @@ func (h *Handler) postCheck(c *gin.Context) {
 		return
 	}
 
-	sub, err := h.store.GetSubscription(ctx, subID, userID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "subscription not found"})
-		return
-	}
-
-	plat, _ := platform.Detect(sub.ProductURL)
-	if err := h.mq.Publish(ctx, broker.QueueTrackRequests, contracts.TrackRequest{
-		Action:    "force",
-		ProductID: sub.ProductID,
-		URL:       sub.ProductURL,
-		Platform:  plat,
-		ChatID:    req.ChatID, // only the requester gets the status message
-	}); err != nil {
-		slog.Error("publish force check", "error", err)
+	if _, err := h.store.QueueForce(ctx, subID, userID, req.ChatID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "subscription not found"})
+			return
+		}
+		slog.Error("queue force check", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
@@ -512,16 +431,6 @@ func (h *Handler) userIDOr404(c *gin.Context, chatID int64) (string, bool) {
 		return "", false
 	}
 	return userID, true
-}
-
-// productStillWatched reports whether the product has at least one active,
-// non-paused subscription left.
-func (h *Handler) productStillWatched(ctx context.Context, productID string) (bool, error) {
-	counts, err := h.store.ProductSubCounts(ctx, productID)
-	if err != nil {
-		return false, err
-	}
-	return counts.Watching > 0, nil
 }
 
 func normalizeURL(plat, rawURL string) (string, error) {

@@ -1,0 +1,109 @@
+name: Go and container checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pricescount_test
+          POSTGRES_PASSWORD: pricescount_test
+          POSTGRES_DB: pricescount_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pricescount_test -d pricescount_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      rabbitmq:
+        image: rabbitmq:3.13-management-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: pricescount_test
+          RABBITMQ_DEFAULT_PASS: pricescount_test
+        ports:
+          - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      TEST_POSTGRES_DSN: postgres://pricescount_test:pricescount_test@127.0.0.1:5432/pricescount_test?sslmode=disable
+      TEST_RABBITMQ_URL: amqp://pricescount_test:pricescount_test@127.0.0.1:5672/
+      TELEGRAM_BOT_TOKEN: 123456:fake-ci-token
+      INTERNAL_TOKEN: fake-ci-internal-token
+      POSTGRES_PASSWORD: fake-ci-postgres-password
+      RABBITMQ_USER: fake-ci-rabbit-user
+      RABBITMQ_PASSWORD: fake-ci-rabbit-password
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: true
+          cache-dependency-path: |
+            go.work.sum
+            shared/go.sum
+            services/bot/go.sum
+            services/gateway/go.sum
+            services/scheduler/go.sum
+            services/extractor/go.sum
+            services/notifier/go.sum
+
+      - name: Verify Go workspace
+        run: go version && go work sync
+
+      - name: Unit tests with race detector (all six modules)
+        run: >-
+          go test -race -count=1 -timeout=180s
+          ./services/bot/... ./services/gateway/... ./services/scheduler/...
+          ./services/extractor/... ./services/notifier/... ./shared/...
+
+      - name: Integration tests with race detector (all six modules)
+        run: >-
+          go test -race -count=1 -timeout=180s -tags=integration
+          ./services/bot/... ./services/gateway/... ./services/scheduler/...
+          ./services/extractor/... ./services/notifier/... ./shared/...
+
+      - name: Build all six modules
+        run: >-
+          go build
+          github.com/Gergov00/pricescount/services/bot/...
+          github.com/Gergov00/pricescount/services/gateway/...
+          github.com/Gergov00/pricescount/services/scheduler/...
+          github.com/Gergov00/pricescount/services/extractor/...
+          github.com/Gergov00/pricescount/services/notifier/...
+          github.com/Gergov00/pricescount/shared/...
+
+      - name: Vet all six modules
+        run: >-
+          go vet
+          github.com/Gergov00/pricescount/services/bot/...
+          github.com/Gergov00/pricescount/services/gateway/...
+          github.com/Gergov00/pricescount/services/scheduler/...
+          github.com/Gergov00/pricescount/services/extractor/...
+          github.com/Gergov00/pricescount/services/notifier/...
+          github.com/Gergov00/pricescount/shared/...
+
+      - name: Build five Docker images
+        run: |
+          docker build -t pricescount-audit-bot:ci -f services/bot/Dockerfile .
+          docker build -t pricescount-audit-gateway:ci -f services/gateway/Dockerfile .
+          docker build -t pricescount-audit-scheduler:ci -f services/scheduler/Dockerfile .
+          docker build -t pricescount-audit-extractor:ci -f services/extractor/Dockerfile .
+          docker build -t pricescount-audit-notifier:ci -f services/notifier/Dockerfile .
+
+      - name: RabbitMQ persistent queue recovery
+        shell: pwsh
+        run: ./tests/recover-broker.ps1

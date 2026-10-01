@@ -2,9 +2,13 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -33,20 +37,47 @@ type SessionStore interface {
 	Get(chatID int64) *state.Session
 	Set(chatID int64, sess *state.Session)
 	Clear(chatID int64)
+	Update(chatID int64, fn func(*state.Session))
+	CompleteLookup(chatID int64, lookupID string, result state.Session) bool
 }
 
 type Bot struct {
-	api   *tgbotapi.BotAPI
-	gw    Gateway
-	state SessionStore
+	api           *tgbotapi.BotAPI
+	gw            Gateway
+	state         SessionStore
+	lookupWG      sync.WaitGroup
+	lookupMu      sync.Mutex
+	activeLookups map[int64]lookupTask
+	lookupSlots   chan struct{}
+	requestClient *contextHTTPClient
+	token         string
 }
 
-func New(token string, st SessionStore, gw Gateway) (*Bot, error) {
-	api, err := tgbotapi.NewBotAPI(token)
-	if err != nil {
-		return nil, fmt.Errorf("bot api: %w", err)
+type Option func(*options)
+type options struct {
+	httpClient  tgbotapi.HTTPClient
+	apiEndpoint string
+}
+
+func WithHTTPClient(client tgbotapi.HTTPClient) Option {
+	return func(o *options) { o.httpClient = client }
+}
+func WithAPIEndpoint(endpoint string) Option { return func(o *options) { o.apiEndpoint = endpoint } }
+
+func New(token string, st SessionStore, gw Gateway, opts ...Option) (*Bot, error) {
+	settings := options{httpClient: &http.Client{Timeout: 35 * time.Second}, apiEndpoint: tgbotapi.APIEndpoint}
+	for _, opt := range opts {
+		opt(&settings)
 	}
-	b := &Bot{api: api, gw: gw, state: st}
+	if settings.httpClient == nil {
+		settings.httpClient = &http.Client{Timeout: 35 * time.Second}
+	}
+	ctxClient := &contextHTTPClient{client: settings.httpClient}
+	api, err := tgbotapi.NewBotAPIWithClient(token, settings.apiEndpoint, ctxClient)
+	if err != nil {
+		return nil, fmt.Errorf("bot api initialization failed: %s", redactToken(err.Error(), token))
+	}
+	b := &Bot{api: api, gw: gw, state: st, token: token, requestClient: ctxClient, activeLookups: make(map[int64]lookupTask), lookupSlots: make(chan struct{}, 8)}
 	b.registerCommands()
 	return b, nil
 }
@@ -56,49 +87,69 @@ func (b *Bot) registerCommands() {
 		{Command: "mylist", Description: "Мои отслеживаемые товары"},
 		{Command: "cancel", Description: "Отменить текущее действие"},
 	}
-	b.api.Request(tgbotapi.NewSetMyCommands(commands...))
+	if _, err := b.api.Request(tgbotapi.NewSetMyCommands(commands...)); err != nil {
+		slog.Warn("register bot commands failed", "error", b.safeError(err))
+	}
 }
 
 func (b *Bot) Run(ctx context.Context) error {
+	b.requestClient.SetContext(ctx)
 	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-	updates := b.api.GetUpdatesChan(u)
-	slog.Info("telegram bot started", "username", b.api.Self.UserName)
-
-	for {
-		select {
-		case <-ctx.Done():
-			b.api.StopReceivingUpdates()
-			return nil
-		case update := <-updates:
-			// Each update is handled in its own goroutine: handlers call the
-			// Gateway and retry Telegram sends with sleeps, and one slow user
-			// must not block the update loop for everyone. Session state is
-			// mutex-protected in state.Store.
-			if update.Message != nil {
-				go b.handleMessage(ctx, update.Message)
-			} else if update.CallbackQuery != nil {
-				go b.handleCallback(ctx, update.CallbackQuery)
+	u.Timeout = 30
+	updates := make(chan tgbotapi.Update, 64)
+	var pollWG sync.WaitGroup
+	pollWG.Add(1)
+	go func() {
+		defer pollWG.Done()
+		defer close(updates)
+		for ctx.Err() == nil {
+			batch, err := b.api.GetUpdates(u)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				slog.Warn("poll telegram updates failed", "error", b.safeError(err))
+				if !waitContext(ctx, 3*time.Second) {
+					return
+				}
+				continue
+			}
+			for _, update := range batch {
+				if update.UpdateID >= u.Offset {
+					u.Offset = update.UpdateID + 1
+				}
+				select {
+				case updates <- update:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
-	}
+	}()
+	slog.Info("telegram bot started", "username", b.api.Self.UserName)
+	err := (&dispatcher{bot: b}).Run(ctx, updates)
+	pollWG.Wait()
+	b.lookupWG.Wait()
+	return err
 }
 
 func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
 
 	if msg.Text == "/start" || msg.Text == "/cancel" {
+		b.cancelLookup(chatID)
 		b.state.Clear(chatID)
 		reply := tgbotapi.NewMessage(chatID,
 			"Привет! Пришли ссылку на товар с Wildberries — я начну следить за ценой.\n\n"+
 				"Пример:\nhttps://www.wildberries.ru/catalog/12345678/detail.aspx")
 		reply.ReplyMarkup = mainKeyboard()
-		b.api.Send(reply)
+		if _, err := b.api.Send(reply); err != nil {
+			slog.Warn("send welcome failed", "chat_id", chatID, "error", b.safeError(err))
+		}
 		return
 	}
 
 	if msg.Text == "/mylist" || msg.Text == "📋 Мои товары" {
-		b.state.Clear(chatID)
 		b.handleMyList(ctx, chatID)
 		return
 	}
@@ -122,16 +173,26 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 }
 
 func (b *Bot) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
-	b.api.Request(tgbotapi.NewCallback(cb.ID, ""))
-	if cb.Message == nil {
+	if _, err := b.api.Request(tgbotapi.NewCallback(cb.ID, "")); err != nil {
+		slog.Warn("answer callback failed", "error", b.safeError(err))
+	}
+	if cb.Message == nil || cb.Message.Chat == nil {
 		return // callback from an inline/expired message — nothing to act on
 	}
 	chatID := cb.Message.Chat.ID
 
 	switch {
+	case strings.HasPrefix(cb.Data, "page:"):
+		page, err := strconv.Atoi(strings.TrimPrefix(cb.Data, "page:"))
+		if err == nil && page >= 1 {
+			b.state.Update(chatID, func(sess *state.Session) { sess.Page = page })
+			b.refreshMyList(ctx, chatID, cb.Message.MessageID)
+		}
 	case strings.HasPrefix(cb.Data, "edit_sub:"):
 		subID := strings.TrimPrefix(cb.Data, "edit_sub:")
-		b.api.Request(tgbotapi.NewDeleteMessage(chatID, cb.Message.MessageID))
+		if err := b.request(tgbotapi.NewDeleteMessage(chatID, cb.Message.MessageID)); err != nil {
+			slog.Warn("delete old message failed", "chat_id", chatID, "error", err)
+		}
 		b.startEditSubscription(ctx, chatID, subID)
 	case strings.HasPrefix(cb.Data, "pause_sub:"):
 		subID := strings.TrimPrefix(cb.Data, "pause_sub:")
@@ -155,17 +216,55 @@ func (b *Bot) send(chatID int64, text string) {
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.DisableWebPagePreview = true
 	delays := []time.Duration{0, 3 * time.Second, 6 * time.Second, 12 * time.Second}
-	for _, d := range delays {
+	for i, d := range delays {
 		if d > 0 {
-			time.Sleep(d)
+			if !waitContext(b.requestClient.Context(), d) {
+				return
+			}
 		}
 		if _, err := b.api.Send(msg); err == nil {
 			return
 		} else if d == delays[len(delays)-1] {
-			slog.Error("send message failed", "chat_id", chatID, "error", err)
+			slog.Error("send message failed", "chat_id", chatID, "error", b.safeError(err))
 		} else {
-			slog.Warn("send message attempt failed, retrying", "chat_id", chatID, "error", err)
+			slog.Warn("send message attempt failed, retrying", "chat_id", chatID, "error", b.safeError(err))
 		}
+		if i == len(delays)-1 {
+			return
+		}
+	}
+}
+
+func (b *Bot) safeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return redactToken(err.Error(), b.token)
+}
+
+func redactToken(message, token string) string {
+	if token == "" {
+		return message
+	}
+	return strings.ReplaceAll(message, token, "[redacted]")
+}
+
+func (b *Bot) request(config tgbotapi.Chattable) error {
+	_, err := b.api.Request(config)
+	if err == nil {
+		return nil
+	}
+	return errors.New(b.safeError(err))
+}
+
+func waitContext(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 

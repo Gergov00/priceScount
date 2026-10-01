@@ -15,6 +15,43 @@ import (
 
 var wbProductIDRe = regexp.MustCompile(`wildberries\.ru/catalog/(\d+)`)
 
+const wbPageDataJS = `JSON.stringify((function() {
+	var priceSelectors = [
+		'[class*="mo-typography_colors_danger"]',
+		'h3[class*="mo-typography_color_danger"]',
+		'[class*="mo-typography_color_danger"]',
+		'[class*="priceBlockFinalPrice"]',
+		'ins.price-block__final-price',
+		'.price-block__final-price',
+		'[class*="price-block__final-price"]',
+		'[class*="finalPrice"]'
+	];
+	function isExcludedPrice(el) {
+		var classes = typeof el.className === 'string' ? el.className : '';
+		return classes.indexOf('priceBlockOldPrice') !== -1 ||
+			classes.indexOf('mo-typography_modifier_strikethrough') !== -1;
+	}
+	var priceEl = null;
+	for (var i = 0; i < priceSelectors.length && !priceEl; i++) {
+		var candidates = document.querySelectorAll(priceSelectors[i]);
+		for (var j = 0; j < candidates.length; j++) {
+			if (!isExcludedPrice(candidates[j]) && candidates[j].innerText.trim()) {
+				priceEl = candidates[j];
+				break;
+			}
+		}
+	}
+	var nameEl = document.querySelector('[class*="productTitle"]') ||
+		 document.querySelector('h1') ||
+		 document.querySelector('h2[class*="mo-typography_color_primary"]');
+	return {
+		price: priceEl ? priceEl.innerText.trim() : '',
+		name:  nameEl ? nameEl.innerText.trim() : '',
+		title: document.title,
+		url:   location.href
+	};
+})())`
+
 // WBClient fetches product data from Wildberries using a headless browser.
 // Stores allocCtx as part of the service lifecycle — Chrome process runs until Close().
 type WBClient struct {
@@ -23,12 +60,16 @@ type WBClient struct {
 }
 
 func NewWBClient() *WBClient {
+	return newWBClient("chromium-browser")
+}
+
+func newWBClient(execPath string) *WBClient {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.NoSandbox,
 		chromedp.DisableGPU,
 		chromedp.Flag("disable-dev-shm-usage", true),
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
-		chromedp.ExecPath("chromium-browser"),
+		chromedp.ExecPath(execPath),
 		chromedp.UserAgent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
 	)
 	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
@@ -41,6 +82,9 @@ func (c *WBClient) Close() {
 }
 
 func (c *WBClient) FetchProduct(ctx context.Context, rawURL string) (*Product, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	m := wbProductIDRe.FindStringSubmatch(rawURL)
 	if m == nil {
 		return nil, fmt.Errorf("invalid wildberries url")
@@ -48,44 +92,31 @@ func (c *WBClient) FetchProduct(ctx context.Context, rawURL string) (*Product, e
 	nmID := m[1]
 	pageURL := "https://www.wildberries.ru/catalog/" + nmID + "/detail.aspx"
 
+	return c.fetchPage(ctx, pageURL, nmID)
+}
+
+func (c *WBClient) fetchPage(parentCtx context.Context, pageURL, nmID string) (*Product, error) {
+	if err := parentCtx.Err(); err != nil {
+		return nil, err
+	}
 	bCtx, bCancel := chromedp.NewContext(c.allocCtx,
 		chromedp.WithLogf(func(format string, args ...interface{}) {}),
 	)
 	defer bCancel()
-
-	tCtx, tCancel := context.WithTimeout(bCtx, 40*time.Second)
-	defer tCancel()
-
+	stopCancel := context.AfterFunc(parentCtx, bCancel)
+	defer stopCancel()
+	ctx, timeoutCancel := context.WithTimeout(bCtx, 40*time.Second)
+	defer timeoutCancel()
 	var jsResult string
-	if err := chromedp.Run(tCtx,
+	if err := chromedp.Run(ctx,
 		chromedp.Navigate(pageURL),
 		chromedp.WaitReady("body", chromedp.ByQuery),
 		chromedp.Sleep(7*time.Second),
-		chromedp.Evaluate(`JSON.stringify((function() {
-			var priceSelectors = [
-				'h3[class*="mo-typography_color_danger"]',
-				'[class*="mo-typography_color_danger"]',
-				'ins.price-block__final-price',
-				'.price-block__final-price',
-				'[class*="price-block__final-price"]',
-				'[class*="finalPrice"]'
-			];
-			var priceEl = null;
-			for (var i = 0; i < priceSelectors.length; i++) {
-				priceEl = document.querySelector(priceSelectors[i]);
-				if (priceEl && priceEl.innerText.trim()) break;
-			}
-			var nameEl = document.querySelector('[class*="productTitle"]') ||
-			             document.querySelector('h1') ||
-			             document.querySelector('h2[class*="mo-typography_color_primary"]');
-			return {
-				price: priceEl ? priceEl.innerText.trim() : '',
-				name:  nameEl ? nameEl.innerText.trim() : '',
-				title: document.title,
-				url:   location.href
-			};
-		})())`, &jsResult),
+		chromedp.Evaluate(wbPageDataJS, &jsResult),
 	); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("wb fetch: %w", err)
 	}
 
