@@ -144,7 +144,7 @@ func (b *Bot) handleMinPrice(ctx context.Context, chatID int64, sess *state.Sess
 	if sess.CurrentPrice > 0 {
 		hint = fmt.Sprintf("Текущая цена: %.0f ₽\n\n", sess.CurrentPrice)
 	}
-	b.send(chatID, hint+"Теперь укажи максимальную цену — уведомлю если цена вырастет выше.\n\nПример: 150000")
+	b.send(chatID, hint+fmt.Sprintf("Теперь укажи максимальную цену — уведомлю если цена вырастет выше.\n\nПример: %0.0f", sess.CurrentPrice*1.1))
 }
 
 func (b *Bot) handleMaxPrice(ctx context.Context, chatID int64, sess *state.Session, text string) {
